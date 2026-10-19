@@ -121,7 +121,8 @@ export async function GET(
     const archive = new ZipArchive({ zlib: { level: 6 } });
     archive.pipe(passThrough);
     for (const filePath of matchingFiles) {
-      archive.file(filePath, { name: path.basename(filePath) });
+      // Flat entry names only: a backslash in a Linux filename would be a folder separator on Windows
+      archive.file(filePath, { name: path.basename(filePath).replace(/[\\/]/g, '_') });
     }
     archive.finalize();
 

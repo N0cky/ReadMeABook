@@ -58,6 +58,20 @@ describe('GET /api/requests/[id]/download', () => {
     expect(zip.getEntry('Part 2.mp3')!.getData().equals(partTwo)).toBe(true);
   });
 
+  it.skipIf(process.platform === 'win32')('flattens a backslash in a file name so the entry cannot become a folder path', async () => {
+    // Only possible on POSIX file systems, where a backslash is an ordinary filename character
+    const tricky = Buffer.from('ID3 tricky');
+    await fs.writeFile(path.join(dir, '..\\..\\evil.mp3'), tricky);
+    const { GET } = await import('@/app/api/requests/[id]/download/route');
+    const response = await GET(request('good'), params);
+
+    const zip = new AdmZip(Buffer.from(await response.arrayBuffer()));
+    const names = zip.getEntries().map((e) => e.entryName).sort();
+    expect(names).toEqual(['.._.._evil.mp3', 'Part 1.mp3', 'Part 2.mp3']);
+    expect(names.some((n) => n.includes('\\') || n.includes('/'))).toBe(false);
+    expect(zip.getEntry('.._.._evil.mp3')!.getData().equals(tricky)).toBe(true);
+  });
+
   it('rejects a bad token', async () => {
     const { GET } = await import('@/app/api/requests/[id]/download/route');
     const response = await GET(request('bad'), params);
