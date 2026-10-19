@@ -8,9 +8,10 @@ import { requireAuth, requireAdmin, AuthenticatedRequest } from '@/lib/middlewar
 import { getConfigService } from '@/lib/services/config.service';
 import { getDownloadClientManager, invalidateDownloadClientManager, DownloadClientConfig } from '@/lib/services/download-client-manager.service';
 import { SUPPORTED_CLIENT_TYPES, CLIENT_PROTOCOL_MAP, DownloadClientType, getClientDisplayName } from '@/lib/interfaces/download-client.interface';
-import { getEncryptionService } from '@/lib/services/encryption.service';
+import { serializeDownloadClients } from '@/lib/services/download-client-storage';
 import { RMABLogger } from '@/lib/utils/logger';
 import { randomUUID } from 'crypto';
+import { MASKED_PASSWORD } from '@/lib/utils/saved-credential';
 
 const logger = RMABLogger.create('API.Admin.Settings.DownloadClients');
 
@@ -28,7 +29,7 @@ export async function GET(request: NextRequest) {
         // Mask passwords in response
         const maskedClients = clients.map(c => ({
           ...c,
-          password: c.password ? '********' : '',
+          password: c.password ? MASKED_PASSWORD : '',
         }));
 
         return NextResponse.json({ clients: maskedClients });
@@ -151,17 +152,9 @@ export async function POST(request: NextRequest) {
           );
         }
 
-        // Encrypt all passwords before saving (existing clients come decrypted from getAllClients)
-        const encryptionService = getEncryptionService();
-        const allClients = [...existingClients, newClient];
-        const encryptedClients = allClients.map(c => ({
-          ...c,
-          password: c.password ? encryptionService.encrypt(c.password) : '',
-        }));
-
-        // Save updated clients array
+        // Save updated clients array (passwords encrypted; existing clients come decrypted from getAllClients)
         await config.setMany([
-          { key: 'download_clients', value: JSON.stringify(encryptedClients) },
+          { key: 'download_clients', value: serializeDownloadClients([...existingClients, newClient]) },
         ]);
 
         // Invalidate cache
@@ -173,7 +166,7 @@ export async function POST(request: NextRequest) {
           message: 'Download client added successfully',
           client: {
             ...newClient,
-            password: '********',
+            password: MASKED_PASSWORD,
           },
         });
       } catch (error) {
