@@ -43,6 +43,9 @@ downloads
 media
 pgdata
 redisdata
+bookdrop
+redis
+.claude
 e2e/
 
 # --- harness additions ---

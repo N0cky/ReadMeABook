@@ -11,7 +11,8 @@ name: rmab-e2e-${E2E_SLUG:?E2E_SLUG is required}
 
 networks:
   stack: {}
-  # fake-arr's control listener is reachable only from here AND requires CONTROL_TOKEN.
+  # The runner reaches fake-arr's control API over this network. fake-arr listens on 0.0.0.0, so the
+  # control port is also reachable from `stack` (incl. RMAB): the per-run CONTROL_TOKEN is the real protection.
   control:
     internal: true
 

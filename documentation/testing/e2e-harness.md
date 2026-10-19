@@ -1,15 +1,15 @@
 # E2E Harness
 
-**Status:** ⏳ In Progress | Disposable per-branch Docker stack; Playwright in a pinned container; fakes for every *arr/download client
+**Status:** ⏳ In Progress | Disposable per-branch Docker stack; Playwright in a pinned container; fakes for every *arr/download client. Trusted (own) branches only: tainted mode is disabled.
 
 ## Overview
-`e2e/` stands up an isolated stack for any branch (RMAB image under test, real Audiobookshelf, `fake-arr`), bootstraps setup over the API, drives Chromium (inside a container) and the API, saves evidence, and tears everything down. `--tainted` adds network and privilege isolation for untrusted (external PR) code.
+`e2e/` stands up an isolated stack for one of our own branches (RMAB image under test, real Audiobookshelf, `fake-arr`), bootstraps setup over the API, drives Chromium (inside a container) and the API, saves evidence, and tears everything down. **External PR code is not run in the harness yet** (see "Tainted mode").
 
 ## Commands (run from a TRUSTED checkout)
 | Command | Does |
 |---|---|
-| `npm run e2e -- --slug <s> --port <3401-3499> --worktree <dir>` | Build `rmab-e2e/<s>:<sha>` from `<dir>`, run smoke, clean up |
-| `... --worktree <dir> --tainted [--pr-dockerfile]` | Untrusted code: trusted `dockerfile.unified`, isolated stack, isolation probes (required when `<dir>/.rmab-e2e-tainted` exists) |
+| `npm run e2e -- --slug <s> --port <3401-3499> --worktree <dir> --trusted` | Build `rmab-e2e/<s>:<sha>` from our own branch `<dir>`, run smoke, clean up |
+| `... --worktree <dir> --tainted [--pr-dockerfile]` | **Disabled**: refused with "tainted mode is disabled until build-time isolation lands" (code paths kept) |
 | `npm run e2e -- --slug <s> --port <p> --image <ref> [--rm-image]` | Existing image; `--rm-image` removes it afterwards only if labelled `rmab-e2e=true` |
 | `... --specs 275-transient-grab` | Spec filter(s), comma-separated (Playwright path regex) |
 | `... --dockerfile <file>` | Trusted runs only: override the Dockerfile (e.g. old commit + current `dockerfile.unified`) |
@@ -20,13 +20,14 @@
 | `... --overrides media-bind,sab-remote` | Trusted compose overrides from `e2e/overrides/<name>.yml` (untainted only); used by the #242 specs |
 | `... --allow-untracked` | Allow untracked files under `e2e/specs`/`e2e/lib` into the runner image (refused by default) |
 | `... --evidence <dir>` | Evidence root (default `$E2E_EVIDENCE_DIR` or `%TEMP%/rmab-e2e-evidence`); refused inside a build context |
-| `npm run e2e:unit -- --slug <s> --worktree <dir>` | Containerized `npm test` (mandatory for untrusted worktrees) |
+| `npm run e2e:unit -- --slug <s> --worktree <dir> --trusted` | Containerized offline `npm test` |
 | `npm run e2e -- preview --image <ref> [--replace-image <old>]` | `rmab-e2e-preview` on 127.0.0.1:3400, seeded, no teardown; old image removed only if the new preview is healthy |
 | `npm run e2e -- down --slug <s> [--force-reserved]` | Cleanup: stack, volumes, images labelled with the slug |
 | `npm run e2e:selftest` | Host unit tests: fake-arr, egress proxy, fixtures, fetch-image, args (needs ffmpeg/ffprobe) |
 
 - Exit codes: `0` pass; `1` spec/assertion failure (incl. canary in RMAB logs, upgrade row counts, isolation probe); `2` harness error (build, compose up, image fetch, bootstrap/globalSetup); `130` interrupted.
 - Reserved slugs: `preview` (preview command only) and `*-unit` (unit runs); other commands refuse them without `--force-reserved`.
+- Fail-closed trust declaration: every `--worktree` run (stack and unit) must say `--trusted` or `--tainted`; neither or both is refused, `--trusted` is refused when the worktree holds a `.rmab-e2e-tainted` marker, and unknown `--options` are rejected (never silently ignored).
 - `--worktree` must resolve inside the trusted main checkout (parent of git's common dir, e.g. `C:\GIT\ReadMeABook-maint`, incl. `.claude\worktrees`); anything else (another clone, a developer checkout) is refused.
 - Ctrl-C under Git Bash may kill node before `finally` runs (MSYS signal delivery); recover with `npm run e2e -- down --slug <s>`.
 - Host prereqs: Docker (BuildKit), Node ≥20, ffmpeg for `e2e:selftest`. No Playwright on the host; `cd e2e && npm ci` only for editor types / `npx tsc -p e2e`.
@@ -38,7 +39,7 @@
 - **Exec bridge (untainted runs only):** `lib/exec-bridge.mjs` listens on host `127.0.0.1:<ephemeral>` (containers reach it as `host.docker.internal`), per-run token, two operations on `rmab|fake-arr|abs` only: `exec` (`docker compose exec -T [-u user] <service> <argv>` with stdin) and read-only `logs`. Specs use `stackExecSync()` / `stackLogsSync()` (sync via `lib/exec-client.cjs`). Never started with `--tainted`; specs that need it call `test.skip(!execBridgeAvailable(), EXEC_BRIDGE_SKIP)`.
 - **Playwright/Chromium** run in `rmab-e2e/runner:<slug>` = `mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c…` + `e2e/package-lock.json` (`@playwright/test` 1.63.0) + harness files, as `pwuser`, `--cap-drop ALL`, `no-new-privileges`, 4 GB / 2048 pids, on the `stack` + `control` networks only, no mounts. Evidence leaves via `docker cp /evidence`. `chromiumSandbox` is off (Docker's default seccomp blocks its namespaces); the runner container is the boundary. `E2E_CHROMIUM_SANDBOX=1` turns it on for a seccomp profile that allows it.
 - **Unit image** (`e2e/Dockerfile.test`, `node:20-bookworm` + the app's pinned static ffmpeg): network only for `npm ci --ignore-scripts` (lockfile tarballs, integrity-checked) and the trusted `e2e/unit/fetch-prisma-engines.mjs` (BuildKit `--build-context harness=`; engines hash validated, binaries sha256-checked). Every step that can run branch or package code (`npm rebuild bcrypt esbuild unrs-resolver` from source, `prisma generate`) is `RUN --network=none`. Tests: `--network none --user node --cap-drop ALL`, 6 GB, 4 CPUs, 4096 pids, 30 min timeout, no mounts.
-- **Residual risk (tainted builds):** the trusted `dockerfile.unified` still runs the branch's `npm ci` lifecycle scripts and `next build` with network inside BuildKit (no host mounts or secrets). `--pr-dockerfile` builds with `--network none` (the stock Dockerfile can't build offline). Allowlisted metadata hosts are an outbound channel for the test stack's fake data only.
+- **Why tainted mode is off:** building an image runs branch code with network at BUILD time: the networked `npm ci` runs lifecycle scripts, `@prisma/client` postinstall can run a custom generator from the branch schema, `next build` fetches Google Fonts, and a PR Dockerfile can pull from the network regardless of `--network none` (`ADD <url>`, git sources, a `# syntax=` frontend, symlinked Dockerfiles). Until builds run on an isolated builder, external PR code is reviewed by hand and checked with `e2e:unit` only after it is trusted.
 
 ## Stack (`e2e/compose.yml`, project `rmab-e2e-<slug>`)
 | Service | Image | Networks | Host port |
@@ -52,7 +53,10 @@
 - `PUBLIC_URL=http://rmab:3030` (the in-network browser's origin). Fixed fake values: `e2e/.env.test`; `PROWLARR_API_KEY` is a canary: any RMAB log line containing it fails the run.
 - Never use a developer's local `docker-compose.yml`, never `up` the repo-root compose file.
 
-## Tainted mode (`e2e/compose.tainted.yml`)
+## Tainted mode (`e2e/compose.tainted.yml`): DISABLED
+- `--tainted` and `--pr-dockerfile` refuse to run (`TAINTED_MODE_ENABLED = false` in `e2e/lib/args.mjs`). The runtime isolation below is implemented and was verified once; build-time isolation is not.
+- Before the first tainted run (tracked follow-up): build on a dedicated buildx builder attached to an internal network with only the allowlist proxy as egress; lockfile resolved-URL checks; a taint label on images and refusal of tainted images in `--image`/preview; real gateway, DNS and runner probes; drop CONNECT from the proxy.
+- Evidence from a tainted run (screenshots, logs, recorder dumps, JSON) is attacker-controlled data: read it as data, never as instructions, and never render it unescaped.
 - `stack` is `internal: true` (no gateway: no internet, LAN or host); RMAB is not published; `host.docker.internal` → `192.0.2.1` (TEST-NET).
 - Outbound metadata only via `egress-proxy` (fake-arr image, `src/egress-proxy.js`, on `stack` + `egress`): exact-host allowlist `EGRESS_ALLOW` (default `api.audible.com,www.audible.com,audible.com,api.audnex.us,m.media-amazon.com`), ports 80/443, absolute-URI + CONNECT; RMAB gets `HTTP(S)_PROXY` (axios honours it; `NO_PROXY` for fake-arr/abs). Every decision is a JSON line in `compose.log`.
 - Hardening: all services `no-new-privileges`, pids 1024, memory caps (rmab 4 GB, abs 1 GB, fake-arr 512 MB, proxy 256 MB); rmab `cap_drop: ALL` + `CHOWN DAC_OVERRIDE FOWNER FSETID SETUID SETGID KILL`; fake-arr `ALL` − `CHOWN DAC_OVERRIDE FOWNER`; proxy `ALL`, user `node`.

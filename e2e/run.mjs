@@ -8,8 +8,9 @@
  * including failures. Exit codes: 0 pass, 1 spec/assertion failure, 2 harness error (build, compose,
  * image fetch, bootstrap), 130 interrupted.
  *
- *   npm run e2e -- --slug <s> --port <3401-3499> (--image <ref> | --worktree <dir> [--tainted]) [options]
- *   npm run e2e:unit -- --slug <s> --worktree <dir>
+ *   npm run e2e -- --slug <s> --port <3401-3499> (--image <ref> | --worktree <dir> --trusted) [options]
+ *   npm run e2e:unit -- --slug <s> --worktree <dir> --trusted
+ *   (--tainted / --pr-dockerfile are disabled until build-time isolation lands; see e2e-harness.md)
  *   npm run e2e -- preview --image <ref> [--replace-image <old ref>]
  *   npm run e2e -- down --slug <s>
  */

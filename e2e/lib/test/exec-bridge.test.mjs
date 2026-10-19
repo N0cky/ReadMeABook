@@ -18,6 +18,7 @@ test('only exec/logs on rmab, fake-arr, abs; user and argv are constrained', () 
     { service: 'rmab', argv: ['true'], user: 'root;rm' },
     { service: 'rmab', argv: ['true'], op: 'cp' },
     { service: 'rmab', argv: ['true'], input: 42 },
+    { service: 'rmab', argv: ['sh', '-c', 'id\u0000; rm -rf /'] },
   ]) {
     assert.throws(() => validateExec(bad), undefined, JSON.stringify(bad));
   }
@@ -36,6 +37,19 @@ test('the bridge listens on loopback only and rejects missing/wrong tokens', asy
     const bad = await fetch(`${base}/exec`, { method: 'POST', headers: { 'x-exec-token': bridge.token }, body: JSON.stringify({ service: 'host', argv: ['id'] }) });
     assert.equal(bad.status, 400);
     assert.equal((await fetch(`${base}/other`, { method: 'POST', headers: { 'x-exec-token': bridge.token } })).status, 404);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('F8: a NUL in argv is a 400 and the bridge keeps serving', async () => {
+  const bridge = await startExecBridge({ project: 'rmab-e2e-x', env: { E2E_TAINTED: '0' } });
+  try {
+    const post = (body) => fetch(`http://127.0.0.1:${bridge.port}/exec`, { method: 'POST', headers: { 'x-exec-token': bridge.token }, body: JSON.stringify(body) });
+    const res = await post({ service: 'rmab', argv: ['echo', 'a\u0000b'] });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /NUL/);
+    assert.equal((await post({ service: 'host', argv: ['id'] })).status, 400, 'still serving after the rejected request');
   } finally {
     await bridge.close();
   }

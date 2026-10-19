@@ -30,6 +30,8 @@ export function validateExec(body) {
   if (!Array.isArray(body.argv) || body.argv.length === 0 || body.argv.length > 64 || !body.argv.every((a) => typeof a === 'string' && a.length < 65536)) {
     throw new Error('argv must be 1-64 strings');
   }
+  // spawn() throws synchronously on NUL bytes in argv; reject them as a 400 instead.
+  if (body.argv.some((a) => a.includes('\0'))) throw new Error('argv must not contain NUL bytes');
   if (body.input !== undefined && typeof body.input !== 'string') throw new Error('input must be a string');
   return body;
 }
@@ -37,17 +39,30 @@ export function validateExec(body) {
 function execInStack({ project, env, tainted }, { op, service, user, argv, input }) {
   return new Promise((resolve) => {
     const sub = op === 'logs' ? ['logs', '--no-color', service] : ['exec', '-T', ...(user ? ['-u', String(user)] : []), service, ...argv];
-    const args = composeArgs(project, sub, { tainted, overrides: env.E2E_OVERRIDES });
-    const child = spawn('docker', args, { env: childEnv(env), stdio: ['pipe', 'pipe', 'pipe'] });
+    // Nothing here may throw past the request handler: a crash would kill run.mjs before cleanup.
+    let child;
+    try {
+      const args = composeArgs(project, sub, { tainted, overrides: env.E2E_OVERRIDES });
+      child = spawn('docker', args, { env: childEnv(env), stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      resolve({ status: 127, stdout: '', stderr: `exec bridge: spawn failed: ${error.message}` });
+      return;
+    }
     const out = [];
     const err = [];
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
     const timer = setTimeout(() => child.kill(), EXEC_TIMEOUT_MS);
+    child.on('error', (error) => finish({ status: 127, stdout: Buffer.concat(out).toString('utf8'), stderr: `exec bridge: ${error.message}` }));
+    child.stdin.on('error', () => {}); // EPIPE when the command exits before reading stdin
     child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      resolve({ status: code ?? 1, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') });
-    });
+    child.on('close', (code) => finish({ status: code ?? 1, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
     child.stdin.end(input ?? '');
   });
 }
@@ -76,11 +91,17 @@ export async function startExecBridge({ project, env }) {
         res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: error.message }));
         return;
       }
-      log(body.op === 'logs' ? `exec-bridge: logs ${body.service}` : `exec-bridge: ${body.service}${body.user ? ` -u ${body.user}` : ''} ${body.argv.join(' ').slice(0, 120)}`);
-      const result = await execInStack({ project, env, tainted: false }, body);
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));
+      try {
+        log(body.op === 'logs' ? `exec-bridge: logs ${body.service}` : `exec-bridge: ${body.service}${body.user ? ` -u ${body.user}` : ''} ${body.argv.join(' ').slice(0, 120)}`);
+        const result = await execInStack({ project, env, tainted: false }, body);
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));
+      } catch (error) {
+        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: error.message }));
+      }
     });
+    req.on('error', () => res.destroy());
   });
+  server.on('clientError', (_error, socket) => socket.destroy());
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   return { url: `http://host.docker.internal:${port}`, port, token, close: () => new Promise((r) => server.close(r)) };
