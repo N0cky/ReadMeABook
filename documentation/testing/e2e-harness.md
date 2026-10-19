@@ -47,7 +47,7 @@
 | `fake-arr:8081` | qBittorrent v2 | `auth/login`, `app/version`, `torrents/{categories,createCategory,editCategory,add,info,files,pause,resume,stop,start,setCategory,delete}` (qbittorrent.service.ts:194-:852) |
 | `fake-arr:8085` | SABnzbd | `/api?mode=version,get_config,set_config,addfile,queue[,delete],history[,delete],pause,resume` (sabnzbd.service.ts:155-:753) |
 | `fake-arr:32400` | Plex | `/identity`, `/library/sections`, `/sections/1/{all,search,refresh}`, `/library/metadata/<k>` (plex.service.ts:220-:794); plex.tv not faked |
-| `:9999` | control | `GET /__control/{health,scenarios,books,requests?since=,state}`, `POST /__control/scenario {name}\|{definition}`, `POST /__control/reset` |
+| `:9999` | control | `GET /__control/{health,scenarios,books,requests?since=,state,plex-library}`, `POST /__control/scenario {name}\|{definition}`, `POST /__control/reset` |
 - Grab key: query `apikey` or `X-Api-Key`; wrong/missing → 401. Recorder keeps every request: `seq, service, listener, host, method, path, query, headers, status, location, added[]`.
 - Downloads: progress from wall clock; non-zero `dlspeed` while moving; files copied into `<save_path>/<name>/` and chowned on the first poll at 100%, before reporting complete (`uploading` / SAB `Completed`).
 
@@ -71,7 +71,7 @@
 ## Specs (`e2e/specs/`)
 | Spec | Asserts |
 |---|---|
-| `smoke.spec.ts` | UI login → search → card Request → qBit add → downloaded → ABS item → `available` (recently-added job triggered) → "In Your Library"; canary never off the Prowlarr origin |
+| `smoke.spec.ts` | (ABS or `--backend plex`: Admin Login toggle, fake Plex library, scan jobs) UI login → search → card Request → qBit add → downloaded → ABS item → `available` (recently-added job triggered) → "In Your Library"; canary never off the Prowlarr origin |
 | `regressions/275-transient-grab.spec.ts` | A's grab answered 503, then B fetched after it (fails here on pre-fix code), qBit got only B, request completes |
 | `upgrade.spec.ts` | Seed on release image; after upgrade: health, admin login, exact rows in users/audiobooks/requests/download_history/api_tokens/blocked_releases, no table shrinks, statuses kept, stored Prowlarr key decrypts |
 | `preview-seed.spec.ts` | Preview has `available`, `downloading`, `failed` requests and one library book |
@@ -83,7 +83,7 @@
 - Kept between runs: only the preview stack and its image.
 
 ## Critical Issues
-- `tests/processors/organize-files.processor.test.ts` "organizes files and triggers filesystem scan when enabled" reaches api.audnex.us / api.audible.com for real; under `e2e:unit` (`--network none`) it times out (20 s). Host `npm test` hides it. Fix belongs in the test (mock the metadata calls), not the harness.
+- Unit tests must not reach the network: `e2e:unit` runs `--network none`, so an unmocked call (e.g. Audnexus via `getAudibleService`) hangs to the 20 s timeout even though host `npm test` passes.
 - `setup/complete` with `authMethod: manual` 500s without a `registration` object (after writing part of the config); bootstrap always sends `registration: { require_admin_approval: true }`.
 - A daemon with broken ghcr.io credentials fails even public pulls (`denied: denied`). `--upgrade-from` then falls back to `e2e/lib/fetch-image.mjs`: anonymous registry API, every blob sha256-verified, OCI layout → `docker load`.
 - Evidence screenshots: explicit 1280x720 JPEGs (`snap()` in `lib/harness.ts`); Playwright's own screenshots are off, traces on.
