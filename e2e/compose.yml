@@ -3,7 +3,8 @@
 #
 # Always driven by e2e/run.mjs from a trusted checkout:
 #   docker compose -p rmab-e2e-<slug> -f e2e/compose.yml [-f e2e/compose.tainted.yml] --env-file e2e/.env.test ...
-# Rules: named volumes only (no host bind mounts). Only RMAB is published (127.0.0.1:RMAB_PORT, trusted
+# Rules: named volumes only (no host bind mounts); shared volumes use nocopy (images ship /media content,
+# e.g. alpine's /media/floppy, and concurrent first mounts race on the copy). Only RMAB is published (127.0.0.1:RMAB_PORT, trusted
 # runs only). The Playwright runner container joins `stack` + `control`; RMAB is never on `control`.
 
 name: rmab-e2e-${E2E_SLUG:?E2E_SLUG is required}
@@ -41,8 +42,14 @@ services:
       - rmab-cache:/app/cache
       - pgdata:/var/lib/postgresql/data
       - redis:/var/lib/redis
-      - downloads:/downloads
-      - media:/media
+      - type: volume
+        source: downloads
+        target: /downloads
+        volume: { nocopy: true }
+      - type: volume
+        source: media
+        target: /media
+        volume: { nocopy: true }
     labels:
       rmab-e2e: "true"
 
@@ -53,7 +60,10 @@ services:
     volumes:
       - abs-config:/config
       - abs-metadata:/metadata
-      - media:/media
+      - type: volume
+        source: media
+        target: /media
+        volume: { nocopy: true }
     labels:
       rmab-e2e: "true"
 
@@ -85,8 +95,14 @@ services:
       PUBLIC_HOST: fake-arr
       TRACKER_HOST: tracker.e2e
     volumes:
-      - downloads:/downloads
-      - media:/media
+      - type: volume
+        source: downloads
+        target: /downloads
+        volume: { nocopy: true }
+      - type: volume
+        source: media
+        target: /media
+        volume: { nocopy: true }
     labels:
       rmab-e2e: "true"
 
