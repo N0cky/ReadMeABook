@@ -144,6 +144,8 @@ test('3A seed: usenet download, mapping off, source removed and library copy kep
   );
   const before = snapshot(c, 'before');
   const since = dbNow();
+  // Only this case's fake-client traffic: the recorder still holds the seed (3A) job and its legitimate history delete.
+  const recSince = (await fakeArr.requests()).at(-1)?.seq ?? 0;
   const created = await rmab.requestBook(book);
   const requestId = created.request.id;
   await waitFor(
@@ -161,7 +163,7 @@ test('3A seed: usenet download, mapping off, source removed and library copy kep
   c.save('rmab-job-events.log', `${fmtEvents(events)}\n`);
   c.save('request-state.tsv', `${requestState(requestId)}\n`);
 
-  const recs = await fakeArr.requests();
+  const recs = await fakeArr.requests(recSince);
   const add = recs.find((r) => r.service === 'sab' && r.added?.some((a) => a.nzoId));
   const nzoId = add?.added?.find((a) => a.nzoId)?.nzoId || '';
   const nzbName = book.title;
@@ -454,7 +456,7 @@ test('5C ebook re-import where the ebook target is the folder that holds the aud
 
 test('1F completed usenet download whose stored path resolves into the media library', async () => {
   const c = new CaseRun('1F-download-resolves-into-library');
-  // Save the fake-client log of the earlier cases first: loading a scenario resets the recorder.
+  // Save the fake-client log of the earlier cases (a scenario load keeps the recorder; only POST /__control/reset clears it).
   evidencePath('242/fake-arr-requests-before-1F.json');
   fs.writeFileSync(evidencePath('242/fake-arr-requests-before-1F.json'), JSON.stringify(await fakeArr.requests(), null, 2));
   restoreLibrary();
@@ -478,6 +480,8 @@ test('1F completed usenet download whose stored path resolves into the media lib
   c.save('scenario-definition.json', def);
   const before = snapshot(c, 'before');
   const since = dbNow();
+  // Only this case's fake-client traffic: the recorder still holds the seed (3A) job and its legitimate history delete.
+  const recSince = (await fakeArr.requests()).at(-1)?.seq ?? 0;
   const created = await rmab.requestBook(book);
   const requestId = created.request.id;
   await waitFor('request downloaded/available', async () => ['downloaded', 'available'].includes(psql(`select status from requests where id = ${sqlStr(requestId)}`)) || null, { timeoutMs: 300_000, intervalMs: 3_000 });
@@ -487,7 +491,7 @@ test('1F completed usenet download whose stored path resolves into the media lib
   const events = eventsSince(since);
   c.save('rmab-job-events.log', `${fmtEvents(events)}\n`);
   c.save('request-state.tsv', `${requestState(requestId)}\n`);
-  const recs = await fakeArr.requests();
+  const recs = await fakeArr.requests(recSince);
   const nzoId = recs.find((r) => r.service === 'sab' && r.added?.some((a) => a.nzoId))?.added?.find((a) => a.nzoId)?.nzoId || '';
   const deletes = await sabHistoryDeletes(nzoId);
   c.save('sab-history-delete-requests.json', deletes);
