@@ -17,6 +17,7 @@
 | `... --backend plex` | Plex-mode setup against fake Plex + local admin (Admin Login toggle) |
 | `... --offline-fixtures` | Fixture metadata from `fixtures/test/offline-metadata.json` (no Audnexus at build) |
 | `... --allow-log-canary` | Don't fail when RMAB logs contain the Prowlarr canary key (pre-fix images only) |
+| `... --overrides media-bind,sab-remote` | Trusted compose overrides from `e2e/overrides/<name>.yml` (untainted only); used by the #242 specs |
 | `... --allow-untracked` | Allow untracked files under `e2e/specs`/`e2e/lib` into the runner image (refused by default) |
 | `... --evidence <dir>` | Evidence root (default `$E2E_EVIDENCE_DIR` or `%TEMP%/rmab-e2e-evidence`); refused inside a build context |
 | `npm run e2e:unit -- --slug <s> --worktree <dir>` | Containerized `npm test` (mandatory for untrusted worktrees) |
@@ -34,6 +35,7 @@
 ## Trust boundary
 - Harness code (`run.mjs`, `lib/`, compose files, specs, Dockerfiles + their `.dockerignore`s) always comes from the trusted checkout. Branch code runs only inside containers: the RMAB image build, the RMAB container, the unit container.
 - On the host: only `node` running trusted harness code, `docker`/`git` CLIs (minimal env: an OS/Docker passthrough allowlist + every `.env.test` key), and `docker exec` probes into the stack.
+- **Exec bridge (untainted runs only):** `lib/exec-bridge.mjs` listens on host `127.0.0.1:<ephemeral>` (containers reach it as `host.docker.internal`), per-run token, one operation: `docker compose exec -T [-u user] <rmab|fake-arr|abs> <argv>` with stdin. Specs use `stackExecSync()` (sync via `lib/exec-client.cjs`). Never started with `--tainted`; specs that need it call `test.skip(!execBridgeAvailable(), EXEC_BRIDGE_SKIP)`.
 - **Playwright/Chromium** run in `rmab-e2e/runner:<slug>` = `mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c…` + `e2e/package-lock.json` (`@playwright/test` 1.63.0) + harness files, as `pwuser`, `--cap-drop ALL`, `no-new-privileges`, 4 GB / 2048 pids, on the `stack` + `control` networks only, no mounts. Evidence leaves via `docker cp /evidence`. `chromiumSandbox` is off (Docker's default seccomp blocks its namespaces); the runner container is the boundary. `E2E_CHROMIUM_SANDBOX=1` turns it on for a seccomp profile that allows it.
 - **Unit image** (`e2e/Dockerfile.test`, `node:20-bookworm` + the app's pinned static ffmpeg): network only for `npm ci --ignore-scripts` (lockfile tarballs, integrity-checked) and the trusted `e2e/unit/fetch-prisma-engines.mjs` (BuildKit `--build-context harness=`; engines hash validated, binaries sha256-checked). Every step that can run branch or package code (`npm rebuild bcrypt esbuild unrs-resolver` from source, `prisma generate`) is `RUN --network=none`. Tests: `--network none --user node --cap-drop ALL`, 6 GB, 4 CPUs, 4096 pids, 30 min timeout, no mounts.
 - **Residual risk (tainted builds):** the trusted `dockerfile.unified` still runs the branch's `npm ci` lifecycle scripts and `next build` with network inside BuildKit (no host mounts or secrets). `--pr-dockerfile` builds with `--network none` (the stock Dockerfile can't build offline). Allowlisted metadata hosts are an outbound channel for the test stack's fake data only.
@@ -94,6 +96,9 @@
 | `regressions/275-transient-grab.spec.ts` | A's grab answered 503, then B fetched after it (fails here on pre-fix code), qBit got only B, request completes |
 | `upgrade.spec.ts` | Seed (available/downloading/failed) on the release image; after upgrade: health, admin login, statuses kept, stored Prowlarr key decrypts. `run.mjs` adds exact host-side row counts: users/audiobooks/requests/download_history/api_tokens/blocked_releases unchanged (snapshot after counts settle), no table shrinks |
 | `preview-seed.spec.ts` | Preview has `available`, `downloading`, `failed` requests and one library book |
+| `regressions/242-delete-guard.spec.ts` | #242: post-import cleanup never deletes library content (sha256 snapshots of `/media`+`/downloads`, symlinks, Bull enqueue; `--overrides media-bind` for case 1E); exec bridge required |
+| `regressions/242-torrent-seeding.spec.ts`, `242-usenet-mapped.spec.ts` | #242 torrent keeps seeding; usenet with remote path mapping (`--overrides sab-remote`); exec bridge required |
+| `harness/exec-bridge.spec.ts` | Bridge works untainted (psql, `-u 1000:1000`, non-zero exit throws); absent when tainted |
 - Helpers: `e2e/lib/harness.ts` (`Rmab`, `Abs`, `fakeArr`, `keyLeaks`, `waitFor`, `snap`). Host-side: `e2e/lib/runner.mjs` (runner container, recorder, canary, isolation probes, row counts).
 
 ## Cleanup (every stack/unit run, in `finally`, incl. failures)
