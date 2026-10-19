@@ -473,7 +473,7 @@ All merged files are validated before marked successful:
 2. **Decode Test:** FFmpeg attempts to decode first and last 10 seconds (catches corruption/truncation)
 3. **Size Check:** File size reasonable for duration (~0.4MB/min minimum, accommodates 64kbps encoding)
 4. **Source verification (`durationVerified`):** chapter files count as imported (and may be cleaned up) only when the merged duration is within min(2%, half the shortest chapter) of the chapters' total; otherwise the merge is kept but the sources stay. See [file-organization.md](../phase3/file-organization.md#verified-import-delete-only-what-reached-the-library)
-5. **`-xerror`:** re-encoding merges (MP3/FLAC/AAC → M4B) stop on the first ffmpeg error; codec-copy merges do not use it (AAC chapter concatenation routinely reports non-monotonic DTS at chapter boundaries)
+5. **No `-xerror`:** a single bad frame must not drop the whole merge (codec-copy AAC concatenation also routinely reports non-monotonic DTS at chapter boundaries); `durationVerified` decides whether the sources may be cleaned up
 
 **If validation fails:**
 - Corrupt file is deleted

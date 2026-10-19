@@ -117,14 +117,14 @@ describe('metadata tagger', () => {
   });
 
   it.each(['/tmp/book.m4b', '/tmp/book.mp3', '/tmp/book.flac'])(
-    'stops on the first ffmpeg error (-xerror) when tagging %s',
+    'does not use -xerror when tagging %s (codec copy would turn benign timestamp warnings into lost tags)',
     async (file) => {
       fsMock.access.mockResolvedValue(undefined);
       mockExecFileSuccess('done');
 
       await tagAudioFileMetadata(file, { title: 'Book', author: 'Author' });
 
-      expect(lastCallArgv()[0]).toBe('-xerror');
+      expect(lastCallArgv()).not.toContain('-xerror');
     }
   );
 

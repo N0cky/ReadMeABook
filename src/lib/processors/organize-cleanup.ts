@@ -288,3 +288,28 @@ export async function cleanupSourceAfterOrganize(
     }
   }
 }
+
+/**
+ * Manual-import source cleanup for an ebook: only the imported ebook file is
+ * removed, never the folder around it (an import folder can also hold an
+ * audiobook or other library content).
+ */
+export async function cleanupEbookSource(
+  downloadPath: string,
+  importedFile: string | undefined,
+  targetPath: string,
+  configService: ConfigurationService,
+  jobId: string | undefined,
+  logger: RMABLogger,
+  evidence: ImportEvidence
+): Promise<void> {
+  if (!importedFile) {
+    logger.warn('Imported ebook file unknown, skipping source cleanup');
+  } else if (path.resolve(importedFile) === path.resolve(downloadPath)) {
+    await cleanupSourceAfterOrganize(downloadPath, targetPath, configService, jobId, logger, evidence);
+  } else {
+    await cleanupSourceAfterOrganize(downloadPath, targetPath, configService, jobId, logger, evidence, [
+      path.relative(downloadPath, importedFile),
+    ]);
+  }
+}

@@ -17,7 +17,7 @@ const taggingState = vi.hoisted(() => ({
   /** Files whose source disappears while tagging runs (simulates a vanished or unreadable file). */
   vanish: new Set<string>(),
 }));
-const probeState = vi.hoisted(() => ({ libraryDuration: 60000, sourceDuration: 60000, libraryRoot: '' }));
+const probeState = vi.hoisted(() => ({ libraryDuration: 60000, sourceDuration: 60000, taggedDuration: 60000, libraryRoot: '' }));
 const lockedDirs = vi.hoisted(() => new Set<string>());
 const mergeState = vi.hoisted(() => ({ durationVerified: true }));
 
@@ -55,6 +55,12 @@ vi.mock('@/lib/utils/metadata-tagger', () => ({
       return { success: true, filePath, taggedFilePath };
     });
   }),
+}));
+
+vi.mock('@/lib/utils/audio-duration', () => ({
+  probeStreamDurationMs: vi.fn(async (filePath: string) =>
+    filePath.endsWith('.tmp') ? probeState.taggedDuration : probeState.sourceDuration
+  ),
 }));
 
 vi.mock('@/lib/utils/chapter-merger', async (importOriginal) => {
@@ -118,6 +124,7 @@ describe('FileOrganizer placement records', () => {
     probeState.libraryRoot = media;
     probeState.libraryDuration = 60000;
     probeState.sourceDuration = 60000;
+    probeState.taggedDuration = 60000;
     lockedDirs.clear();
     mergeState.durationVerified = true;
   });
@@ -158,8 +165,8 @@ describe('FileOrganizer placement records', () => {
   it('places the original untagged when the tagged copy loses duration', async () => {
     configState.values.set('metadata_tagging_enabled', 'true');
     write(path.join(source, 'Book.m4b'), 'original-bytes');
-    // The tagged copy placed in the library probes 40 s short of the original
-    probeState.libraryDuration = 20000;
+    // The tagged copy probes 40 s short of the original (checked before it is placed)
+    probeState.taggedDuration = 20000;
 
     const result = await organize();
 
@@ -184,6 +191,18 @@ describe('FileOrganizer placement records', () => {
     expect(byName.get('Part 1.mp3')).toMatchObject({ status: 'copied', verified: true });
     expect(byName.get('Part 2.mp3')).toMatchObject({ status: 'differs', verified: false });
     expect(result.errors.join(' ')).toContain('Part 2.mp3 not imported');
+  });
+
+  it('succeeds when every file is already in the library with different content (nothing overwritten)', async () => {
+    write(path.join(source, 'Part 1.mp3'), 'new download one');
+    const target = path.join(media, 'Author', 'Book');
+    write(path.join(target, 'Part 1.mp3'), 'the library copy, longer than the new one');
+
+    const result = await organize();
+
+    expect(result.success).toBe(true);
+    expect(result.records![0]).toMatchObject({ status: 'differs', verified: false });
+    expect(fs.readFileSync(path.join(target, 'Part 1.mp3'), 'utf8')).toBe('the library copy, longer than the new one');
   });
 
   it('marks the inventory incomplete when a source folder cannot be listed', async () => {

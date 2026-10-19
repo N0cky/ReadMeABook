@@ -785,22 +785,6 @@ describe('file organizer', () => {
     expect(walk).toEqual({ files: [], complete: false });
   });
 
-  it('cleans up download directories safely', async () => {
-    fsMock.rm.mockRejectedValue(new Error('rm failed'));
-
-    const organizer = new FileOrganizer('/media', '/tmp');
-    await expect(organizer.cleanup('/downloads/book')).resolves.toBeUndefined();
-    expect(fsMock.rm).toHaveBeenCalledWith('/downloads/book', { recursive: true, force: true });
-  });
-
-  it('cleans up download directories on success', async () => {
-    fsMock.rm.mockResolvedValue(undefined);
-
-    const organizer = new FileOrganizer('/media', '/tmp');
-    await expect(organizer.cleanup('/downloads/book')).resolves.toBeUndefined();
-    expect(fsMock.rm).toHaveBeenCalledWith('/downloads/book', { recursive: true, force: true });
-  });
-
   it('validates writable directories without issues', async () => {
     fsMock.access.mockResolvedValue(undefined);
     fsMock.stat.mockResolvedValue({ isDirectory: () => true });

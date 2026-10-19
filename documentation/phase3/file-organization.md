@@ -259,9 +259,11 @@ When user deletes and re-requests the same audiobook:
 
 ## Verified Import (delete only what reached the library)
 
-**Code:** `src/lib/utils/copy-file.ts`, `src/lib/utils/organize-copy.ts`, `src/lib/utils/import-inventory.ts`
+**Code:** `src/lib/utils/copy-file.ts`, `src/lib/utils/organize-copy.ts`, `src/lib/utils/import-inventory.ts`, `src/lib/utils/audio-duration.ts`, `src/lib/processors/organize-evidence.ts`
 
-**Atomic copy (`copyFile`):** writes `<target dir>/.rmab-partial-<sha256(name)[:12]>-<rand>.part` through one FileHandle (write, fsync, close all fatal) → size must equal the source → `rename` over the target → final path must have that size and the partial's dev/ino (when ino ≠ 0) → best-effort directory fsync (EINVAL/ENOTSUP/EISDIR/EBADF/EPERM/EACCES ignored). Failed rename (EXDEV, EBUSY, EACCES, …) = failed; never falls back to writing the final name. A crash leaves only a hidden `.part` file.
+**Atomic copy (`copyFile`):** writes `<target dir>/.rmab-partial-<sha256(name)[:12]>-<rand>.part` through one FileHandle (write, fsync, close all fatal) → size must equal the source → publish → final path must have that size and the partial's dev/ino (when ino ≠ 0) → best-effort directory fsync (EINVAL/ENOTSUP/EISDIR/EBADF/EPERM/EACCES ignored). An inode change after publish or a failed folder fsync is accepted only if the final file holds the source's exact bytes. Failed rename/link (EXDEV, EBUSY, EACCES, …) = failed; never falls back to writing the final name. A crash leaves only a hidden `.part` file.
+- Publish modes: `replace` (rename over; used to repair an interrupted copy or replace a bad tagged copy) and `create` (new targets: `link(partial, dest)` then unlink the partial; `EEXIST` if the target appeared → `placeFile` re-runs the existing-target rules on it). Filesystems without hard links fall back to lstat + rename, serialized in-process.
+- `placeFile` also serializes placements per target name (any extension) in-process: two organize jobs (queue concurrency 2) placing the same generic file name never overwrite each other; the second gets `identical`/`differs`.
 
 **Stale partials:** before placing, regular files in that one target folder matching the exact pattern are removed when they belong to this target name or are older than 24 h.
 
@@ -278,8 +280,8 @@ When user deletes and re-requests the same audiobook:
 | larger | `differs` |
 
 - `.mp4` / `.m4a` targets also match an existing `<name>.m4b` (Plex format coercion rename).
-- Tagged derivative (`<source>.tmp`, ffmpeg `-xerror`): verified only if the placed file's ffprobe duration is within 1 s of the original's; otherwise (or on probe failure) the original is placed untagged (byte-checked). A derivative that fails or differs falls back to the original.
-- Chapter merge: inputs map to the merged target; verified only if the merged duration is within min(2%, half the shortest chapter) of the chapters' total (`MergeResult.durationVerified`). Otherwise the merged file and all sources are kept. `-xerror` is used for re-encoding merges only: codec-copy concatenation of AAC chapters routinely logs non-monotonic DTS at chapter boundaries, which `-xerror` turns into a failed merge.
+- Tagged derivative (`<source>.tmp`): checked before it is placed: its audio duration must be within 1 s of the original's, both measured from the first audio stream's packets (`probeStreamDurationMs`; `format.duration` is an estimate for e.g. VBR MP3 without a Xing header). Otherwise (or on probe failure) the original is placed untagged (byte-checked). A derivative that fails or differs at placement falls back to the original. Tagging does not use `-xerror` (codec copy would turn benign timestamp warnings into lost tags).
+- Chapter merge: inputs map to the merged target; verified only if the merged duration is within min(2%, half the shortest chapter) of the chapters' total (`MergeResult.durationVerified`). Otherwise the merged file and all sources are kept. Merges do not use `-xerror` (one bad frame must not drop the merge; `durationVerified` guards deletes).
 - Compare cost: same-size compares run only when a delete may follow (manual `cleanupSource`, or a download that cleanup would remove); they stop at the first differing chunk.
 
 **Deletes consume the records (`ImportEvidence`):**
@@ -287,7 +289,18 @@ When user deletes and re-requests the same audiobook:
 - Whole folder or file (download cleanup, `cleanupSource` without selection, direct download): inventory complete (every source folder readable) and every audio file found in it verified; then a fresh walk right before removal must be complete and find no audio (or ebook) file the import never saw. Otherwise the download is kept and `postProcess` (client history archive) is skipped.
 - Ebook folders: kept when they hold more ebook files than were imported.
 - Only audio (or the ebook) is verified: non-audio extras (cover, nfo, samples) go with the folder.
-- Partial imports are visible: the request keeps status `downloaded` with `errorMessage` `"<n> of <m> files not imported; source files kept"` (shown amber in the admin requests table); a full import clears `errorMessage`.
+- Request messages (`errorMessage` on status `downloaded`, shown amber in the admin requests table; a full import clears it; audiobooks and ebooks):
+
+| Situation | Message |
+|-----------|---------|
+| some files failed | `<n> of <m> files not imported; source files kept` |
+| every file already in the library with different content | `already in the library with different content; source kept` (not a failure; no failure notification) |
+| merge kept outside the strict duration window | `merged file kept; sources kept` |
+| source folder not fully readable | `... source folder could not be fully read; source files kept` |
+
+- Kindle-fixed EPUB: the library gets the fixed copy; the original EPUB counts as imported once that copy is placed (`copied`/`identical`).
+- EPUB folders: other files next to the ebook (cover, opf, extras) are not verified and go with the folder when it is removed.
+- Not covered here: seeded-torrent cleanup (`cleanup_seeded_torrents`) removes torrent data after seeding without import evidence, and library matching clears the partial-import message. Tracked separately.
 
 ## Interface
 

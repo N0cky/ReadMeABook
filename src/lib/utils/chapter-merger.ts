@@ -646,11 +646,6 @@ export async function mergeChapters(
 
     // Build ffmpeg argv (passed directly to spawn - values need no quoting or escaping)
     const args: string[] = [
-      // Re-encodes stop on the first error instead of writing a damaged merge.
-      // Codec-copy merges cannot: concatenated AAC chapters routinely have
-      // non-monotonic DTS at chapter boundaries, which -xerror turns into a
-      // failed merge; those rely on the duration and decode checks below.
-      ...(needsReencode ? ['-xerror'] : []),
       '-y',
       '-f', 'concat',
       '-safe', '0',

@@ -194,6 +194,50 @@ describe('verified-import cleanup', () => {
     });
   });
 
+  describe('request messages', () => {
+    let download: string;
+    let parts: string[];
+    const target = () => path.join(media, 'Author', 'Book');
+
+    beforeEach(() => {
+      download = path.join(downloads, 'Book.Name');
+      parts = ['Part 1.mp3', 'Part 2.mp3'].map((n) => mkfile(path.join(download, n)));
+      useCompletedDownload(download);
+    });
+
+    it('a library that already has different files is not a failure: downloaded, source kept, no failure notification', async () => {
+      organizeWith(target(), { [parts[0]]: 'differs', [parts[1]]: 'differs' });
+
+      const result = await runOrganize({ downloadPath: download, downloadHistoryId: 'dh-1' });
+
+      expect(result.success).toBe(true);
+      expect(requestUpdateData()?.errorMessage).toBe('already in the library with different content; source kept');
+      expect(parts.every((p) => fs.existsSync(p))).toBe(true);
+      expect(jobQueueMock.addNotificationJob.mock.calls.some((call: unknown[]) => call[0] === 'request_error')).toBe(false);
+    });
+
+    it('a merge kept outside the strict duration window says so instead of "not imported"', async () => {
+      organizeWith(target(), { [parts[0]]: 'copied', [parts[1]]: 'copied' });
+      const merged = await organizerMock.organize();
+      merged.records = merged.records.map((r: Record<string, unknown>) => ({ ...r, verified: false }));
+      organizerMock.organize.mockResolvedValue(merged);
+
+      await runOrganize({ downloadPath: download, downloadHistoryId: 'dh-1' });
+
+      expect(requestUpdateData()?.errorMessage).toBe('merged file kept; sources kept');
+      expect(fs.existsSync(download)).toBe(true);
+    });
+
+    it('an incomplete source listing is shown on the request', async () => {
+      organizeWith(target(), { [parts[0]]: 'copied', [parts[1]]: 'copied' }, { complete: false });
+
+      await runOrganize({ downloadPath: download, downloadHistoryId: 'dh-1' });
+
+      expect(requestUpdateData()?.errorMessage).toBe('source folder could not be fully read; source files kept');
+      expect(fs.existsSync(download)).toBe(true);
+    });
+  });
+
   describe('manual import source cleanup', () => {
     it('removes only the selected files whose import is verified', async () => {
       const source = path.join(downloads, 'manual', 'Book');
@@ -242,6 +286,35 @@ describe('verified-import cleanup', () => {
       expect(fs.existsSync(imported)).toBe(true);
       expect(fs.existsSync(other)).toBe(true);
       expect(postProcess).not.toHaveBeenCalled();
+    });
+
+    it('clears a stale request message on a complete ebook import', async () => {
+      const download = path.join(downloads, 'Ebook');
+      const imported = mkfile(path.join(download, 'a-book.epub'), 'epub-a');
+      useCompletedDownload(download);
+      organizerMock.organizeEbook.mockResolvedValue({
+        success: true, targetPath: path.join(media, 'Author', 'Book'), format: 'epub', errors: [], sourceFile: imported,
+        record: { source: imported, target: path.join(media, 'Author', 'Book', 'Book.epub'), status: 'copied', verified: true },
+      });
+
+      await runOrganize({ downloadPath: download, downloadHistoryId: 'dh-1' });
+
+      expect(requestUpdateData()).toMatchObject({ status: 'downloaded', errorMessage: null });
+    });
+
+    it('an ebook already in the library with different content is downloaded with a message, source kept', async () => {
+      const download = path.join(downloads, 'Ebook');
+      const imported = mkfile(path.join(download, 'a-book.epub'), 'epub-a');
+      useCompletedDownload(download);
+      organizerMock.organizeEbook.mockResolvedValue({
+        success: true, targetPath: path.join(media, 'Author', 'Book'), format: 'epub', errors: [], sourceFile: imported,
+        record: { source: imported, target: path.join(media, 'Author', 'Book', 'Book.epub'), status: 'differs', verified: false },
+      });
+
+      await runOrganize({ downloadPath: download, downloadHistoryId: 'dh-1' });
+
+      expect(requestUpdateData()).toMatchObject({ status: 'downloaded', errorMessage: 'already in the library with different content; source kept' });
+      expect(fs.existsSync(imported)).toBe(true);
     });
 
     it('removes an ebook download folder that holds only the imported ebook', async () => {

@@ -13,6 +13,7 @@ import { copyFile } from './copy-file';
 import { placeAudio, placeFile, isVerifiedStatus, type AudioPlacement } from './organize-copy';
 import { walkFiles, ORGANIZER_EBOOK_FORMATS, type ImportInventory, type PlacementRecord } from './import-inventory';
 import { getMediaDir } from './media-dir';
+import { probeStreamDurationMs } from './audio-duration';
 import { MAX_COVER_ART_BYTES, MAX_COVER_ART_REDIRECTS, cachedThumbnailPath, isAllowedRemoteCoverUrl, isLibraryCoverSource } from './cover-art-url';
 
 const moduleLogger = RMABLogger.create('FileOrganizer');
@@ -22,7 +23,6 @@ import {
   mergeChapters,
   formatDuration,
   estimateOutputSize,
-  probeAudioFile,
   checkDiskSpace,
 } from './chapter-merger';
 import { prisma } from '../db';
@@ -410,7 +410,7 @@ export class FileOrganizer {
         const placed: AudioPlacement = await placeAudio(originalSourcePath, taggedFilePath, targetFilePath, {
           fileMode: this.fileMode,
           compareExisting: placement?.compareExisting === true,
-          probeDuration: async (p) => (await probeAudioFile(p)).duration,
+          probeDuration: probeStreamDurationMs,
         });
 
         // Records are keyed on the original source; a merged file stands for all its chapters
@@ -454,8 +454,12 @@ export class FileOrganizer {
             moduleLogger.debug(`File already exists, skipping: ${filename}`);
             break;
           case 'differs':
+            // The library already has a file by this name; it stays, and so does the source
             await logger?.warn(`Not imported, left untouched: ${filename} (${placed.reason})`);
             result.errors.push(`${filename} not imported: ${placed.reason}`);
+            if ((await fs.lstat(placed.target).catch(() => null))?.isFile()) {
+              result.audioFiles.push(placed.target);
+            }
             break;
           default:
             await logger?.error(`Failed to copy ${filename}: ${placed.reason}`);
@@ -763,20 +767,6 @@ export class FileOrganizer {
   }
 
   /**
-   * Clean up download directory
-   */
-  async cleanup(downloadPath: string): Promise<void> {
-    try {
-      // Remove download directory and all remaining files
-      await fs.rm(downloadPath, { recursive: true, force: true });
-      moduleLogger.debug(`Cleaned up: ${downloadPath}`);
-    } catch (error) {
-      moduleLogger.error(`Cleanup failed for ${downloadPath}`, { error: error instanceof Error ? error.message : String(error) });
-      // Don't throw - cleanup is non-critical
-    }
-  }
-
-  /**
    * Validate directory structure
    */
   async validate(basePath: string): Promise<ValidationResult> {
@@ -917,13 +907,16 @@ export class FileOrganizer {
         throw new Error(`Failed to copy ebook ${targetFilename}: ${placed.reason}`);
       }
       if (placed.status === 'differs') {
-        throw new Error(`Ebook not imported: ${targetFilename} already exists with different content (${placed.reason})`);
+        // Not a failure: the library keeps its own file, the source stays
+        await logger?.warn(`Ebook not imported, left untouched: ${targetFilename} (${placed.reason})`);
+        result.errors.push(`${targetFilename} not imported: ${placed.reason}`);
+      } else {
+        await logger?.info(
+          placed.status === 'copied'
+            ? `Copied ebook: ${targetFilename}`
+            : `Ebook already exists at target, skipping copy: ${targetFilename}`
+        );
       }
-      await logger?.info(
-        placed.status === 'copied'
-          ? `Copied ebook: ${targetFilename}`
-          : `Ebook already exists at target, skipping copy: ${targetFilename}`
-      );
 
       // The source is never deleted here. Direct HTTP download files are removed
       // afterwards by the post-organize cleanup, behind the delete guard.

@@ -74,13 +74,40 @@ async function findExistingTarget(target: string): Promise<string | null> {
   return null;
 }
 
-async function copyInto(source: string, target: string, fileMode: number): Promise<PlaceResult> {
+async function copyInto(
+  source: string,
+  target: string,
+  fileMode: number,
+  mode: 'create' | 'replace'
+): Promise<PlaceResult & { exists?: boolean }> {
   try {
-    await copyFile(source, target);
+    await copyFile(source, target, { mode });
     await fs.chmod(target, fileMode).catch(() => undefined);
     return { status: 'copied', target };
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      return { status: 'failed', target, reason: 'target appeared during the copy', exists: true };
+    }
     return { status: 'failed', target, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Placements into the same target (any extension: .mp4 and its coerced .m4b) run one at a time
+const targetLocks = new Map<string, Promise<void>>();
+
+async function withTargetLock<T>(target: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.join(path.resolve(path.dirname(target)), path.basename(target, path.extname(target))).toLowerCase();
+  const previous = targetLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => mine);
+  targetLocks.set(key, tail);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (targetLocks.get(key) === tail) targetLocks.delete(key);
   }
 }
 
@@ -93,13 +120,27 @@ async function copyInto(source: string, target: string, fileMode: number): Promi
  * - smaller and a byte-prefix of the source (interrupted copy): re-copied
  * - same size: `identical` / `differs` by content when compareExisting, else `present`
  * - anything else: `differs`, never overwritten
+ *
+ * A new target is published without overwriting (hard link, EEXIST-safe), so
+ * two jobs placing the same name never replace each other's file: the second
+ * sees the first one's file and applies the rules above to it.
  */
 export async function placeFile(source: string, target: string, options: PlaceOptions): Promise<PlaceResult> {
+  return withTargetLock(target, () => placeUnlocked(source, target, options, true));
+}
+
+async function placeUnlocked(source: string, target: string, options: PlaceOptions, retryOnRace: boolean): Promise<PlaceResult> {
   await removeStalePartials(path.dirname(target), path.basename(target));
 
   const existing = await findExistingTarget(target);
   if (!existing) {
-    return copyInto(source, target, options.fileMode);
+    const created = await copyInto(source, target, options.fileMode, 'create');
+    if (created.exists && retryOnRace) {
+      return placeUnlocked(source, target, options, false);
+    }
+    const { exists: _exists, ...result } = created;
+    void _exists;
+    return result;
   }
 
   let targetStat;
@@ -122,7 +163,9 @@ export async function placeFile(source: string, target: string, options: PlaceOp
     if (targetStat.size < sourceStat.size) {
       if (await sameLeadingBytes(existing, source, targetStat.size)) {
         // Only an interrupted copy of this exact source leaves a byte-prefix behind
-        return copyInto(source, existing, options.fileMode);
+        const { exists: _exists, ...result } = await copyInto(source, existing, options.fileMode, 'replace');
+        void _exists;
+        return result;
       }
       return { status: 'differs', target: existing, reason: 'existing target is smaller and not a prefix of the source' };
     }
@@ -150,7 +193,7 @@ export function isVerifiedStatus(status: PlacementStatus): boolean {
 // =========================================================================
 
 export interface AudioPlaceOptions extends PlaceOptions {
-  /** Duration in ms; throws or returns <= 0 when the file cannot be probed. */
+  /** Audio duration in ms (from stream packets); throws or returns <= 0 when it cannot be probed. */
   probeDuration: (filePath: string) => Promise<number>;
 }
 
@@ -160,9 +203,10 @@ export interface AudioPlacement extends PlaceResult {
   usedDerivative: boolean;
 }
 
-async function durationsMatch(original: string, placed: string, probe: (p: string) => Promise<number>): Promise<boolean> {
+async function durationsMatch(original: string, derivative: string, probe: (p: string) => Promise<number>): Promise<boolean> {
   try {
-    const [a, b] = await Promise.all([probe(original), probe(placed)]);
+    const a = await probe(original);
+    const b = await probe(derivative);
     return a > 0 && b > 0 && Math.abs(a - b) <= TAGGED_DURATION_TOLERANCE_MS;
   } catch {
     return false;
@@ -175,11 +219,12 @@ async function placeOriginal(original: string, target: string, options: PlaceOpt
 }
 
 /**
- * Place one audio source. A tagged derivative is preferred, but it only counts
- * as verified when the placed file's duration matches the original's within
- * TAGGED_DURATION_TOLERANCE_MS; otherwise the original is placed untagged
- * (byte-checked by the copy). A derivative that cannot be placed, or an
- * existing target that differs from it, falls back to the original too.
+ * Place one audio source. The tagged derivative is checked first, where it was
+ * written: its audio duration (from the stream's packets) must match the
+ * original's within TAGGED_DURATION_TOLERANCE_MS. Otherwise the original is
+ * placed untagged (byte-checked by the copy). A derivative that cannot be
+ * placed, or an existing target that differs from it, falls back to the
+ * original too.
  */
 export async function placeAudio(
   original: string,
@@ -189,6 +234,14 @@ export async function placeAudio(
 ): Promise<AudioPlacement> {
   if (!derivative) {
     return placeOriginal(original, target, options);
+  }
+
+  if (!(await durationsMatch(original, derivative, options.probeDuration))) {
+    const untagged = await placeOriginal(original, target, options);
+    return {
+      ...untagged,
+      reason: untagged.reason ?? 'tagged copy duration did not match the original; original placed without metadata tags',
+    };
   }
 
   const tagged = await placeFile(derivative, target, options);
@@ -201,22 +254,5 @@ export async function placeAudio(
         : fallback.reason ?? tagged.reason,
     };
   }
-
-  if (await durationsMatch(original, tagged.target, options.probeDuration)) {
-    return { ...tagged, verified: isVerifiedStatus(tagged.status), usedDerivative: true };
-  }
-
-  if (tagged.status === 'present') {
-    // Not ours to overwrite: unknown content of the right size
-    return { ...tagged, verified: false, usedDerivative: false, reason: 'existing target could not be verified' };
-  }
-
-  // The tagged bytes we placed (or that a previous run placed) are suspect: use the original
-  const replaced = await copyInto(original, tagged.target, options.fileMode);
-  return {
-    ...replaced,
-    verified: replaced.status === 'copied',
-    usedDerivative: false,
-    reason: replaced.reason ?? 'tagged copy duration did not match the original; original placed untagged',
-  };
+  return { ...tagged, verified: isVerifiedStatus(tagged.status), usedDerivative: true };
 }

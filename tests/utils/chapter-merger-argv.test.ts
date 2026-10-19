@@ -76,13 +76,13 @@ beforeEach(() => {
 });
 
 describe('chapter merge verification', () => {
-  it('re-encoding merges stop on the first error; codec-copy merges do not use -xerror', async () => {
+  it('never uses -xerror: a single bad frame must not drop the merge (durationVerified guards deletes)', async () => {
     await mergeChapters([chapter('/dl/01.mp3'), chapter('/dl/02.mp3')], { title: 'B', author: 'A', outputPath: '/t/out.m4b' });
     await mergeChapters([chapter('/dl/01.m4a'), chapter('/dl/02.m4a')], { title: 'B', author: 'A', outputPath: '/t/out.m4b' });
 
-    const [reencodeArgs, copyArgs] = spawnMock.mock.calls.map((call) => call[1] as string[]);
-    expect(reencodeArgs[0]).toBe('-xerror');
-    expect(copyArgs).not.toContain('-xerror');
+    for (const call of spawnMock.mock.calls) {
+      expect(call[1] as string[]).not.toContain('-xerror');
+    }
   });
 
   it('marks the duration verified when the merged file matches the chapters', async () => {

@@ -138,6 +138,26 @@ describe('placeFile', () => {
     expect(fs.existsSync(path.join(path.dirname(target), 'Book.mp4'))).toBe(false);
   });
 
+  it('two concurrent placements of the same name never overwrite each other', async () => {
+    const other = Buffer.from(SOURCE);
+    other[0] ^= 0xff;
+    const sourceB = write('downloads/Other/Book.m4b', other);
+
+    const [a, b] = await Promise.all([placeFile(source, target, OPTS), placeFile(sourceB, target, OPTS)]);
+
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual(['copied', 'differs']);
+    const winner = a.status === 'copied' ? SOURCE : other;
+    expect(fs.readFileSync(target).equals(winner)).toBe(true);
+  });
+
+  it('a placement racing a file that appears at the target re-checks it instead of overwriting', async () => {
+    const results = await Promise.all([placeFile(source, target, OPTS), placeFile(source, target, OPTS)]);
+
+    expect(results.map((r) => r.status).sort()).toEqual(['copied', 'identical']);
+    expect(fs.readFileSync(target).equals(SOURCE)).toBe(true);
+  });
+
   it('reports a missing source as failed', async () => {
     const result = await placeFile(path.join(root, 'downloads', 'missing.m4b'), target, OPTS);
 

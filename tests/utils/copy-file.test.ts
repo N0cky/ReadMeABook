@@ -14,6 +14,8 @@ const failures = vi.hoisted(() => ({
   renameCode: null as null | string,
   writeCode: null as null | string,
   syncCode: null as null | string,
+  linkCode: null as null | string,
+  dirSyncCode: null as null | string,
 }));
 
 vi.mock('fs', async (importOriginal) => {
@@ -42,8 +44,22 @@ vi.mock('fs', async (importOriginal) => {
 
 vi.mock('fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs/promises')>();
+  const nodeFs = await import('fs');
+  const actual_isDir = (p: string) => {
+    try {
+      return nodeFs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
   return {
     ...actual,
+    link: async (from: string, to: string) => {
+      if (failures.linkCode) {
+        throw Object.assign(new Error(`${failures.linkCode}: link not supported`), { code: failures.linkCode });
+      }
+      return actual.link(from, to);
+    },
     rename: async (from: string, to: string) => {
       if (failures.renameCode) {
         throw Object.assign(new Error(`${failures.renameCode}: rename failed`), { code: failures.renameCode });
@@ -52,6 +68,16 @@ vi.mock('fs/promises', async (importOriginal) => {
     },
     open: async (...args: Parameters<typeof actual.open>) => {
       const handle = await actual.open(...args);
+      if (failures.dirSyncCode && actual_isDir(String(args[0]))) {
+        const code = failures.dirSyncCode;
+        return new Proxy(handle, {
+          get(target, prop, receiver) {
+            if (prop === 'sync') return async () => { throw Object.assign(new Error(`${code}: dir sync failed`), { code }); };
+            const value = Reflect.get(target, prop, receiver);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      }
       if (!String(args[0]).includes('.rmab-partial-')) return handle;
       return new Proxy(handle, {
         get(target, prop, receiver) {
@@ -85,6 +111,8 @@ describe('copyFile (atomic)', () => {
     failures.renameCode = null;
     failures.writeCode = null;
     failures.syncCode = null;
+    failures.linkCode = null;
+    failures.dirSyncCode = null;
   });
 
   afterEach(() => {
@@ -150,6 +178,39 @@ describe('copyFile (atomic)', () => {
 
     expect(realFs.readFileSync(dest, 'utf8')).toBe('previous library copy');
     expect(partialsIn(destDir)).toEqual([]);
+  });
+
+  it('create mode publishes a new file and never overwrites an existing one (EEXIST)', async () => {
+    const { source, destDir, dest } = setup();
+
+    await expect(copyFile(source, dest, { mode: 'create' })).resolves.toEqual({ bytes: BYTES.length, sameFile: false });
+    expect(realFs.readFileSync(dest).equals(BYTES)).toBe(true);
+
+    realFs.writeFileSync(dest, 'another job got here first');
+    await expect(copyFile(source, dest, { mode: 'create' })).rejects.toMatchObject({ code: 'EEXIST' });
+    expect(realFs.readFileSync(dest, 'utf8')).toBe('another job got here first');
+    expect(partialsIn(destDir)).toEqual([]);
+  });
+
+  it('create mode falls back to a checked rename where hard links are not supported', async () => {
+    const { source, destDir, dest } = setup();
+    failures.linkCode = 'EPERM';
+
+    await copyFile(source, dest, { mode: 'create' });
+    expect(realFs.readFileSync(dest).equals(BYTES)).toBe(true);
+
+    realFs.writeFileSync(dest, 'existing');
+    await expect(copyFile(source, dest, { mode: 'create' })).rejects.toMatchObject({ code: 'EEXIST' });
+    expect(realFs.readFileSync(dest, 'utf8')).toBe('existing');
+    expect(partialsIn(destDir)).toEqual([]);
+  });
+
+  it('a failed folder fsync is accepted when the published file holds the source bytes', async () => {
+    const { source, dest } = setup();
+    failures.dirSyncCode = 'EIO';
+
+    await expect(copyFile(source, dest)).resolves.toMatchObject({ sameFile: false });
+    expect(realFs.readFileSync(dest).equals(BYTES)).toBe(true);
   });
 
   it('keeps partial names bounded and matching the pattern for very long target names', () => {
