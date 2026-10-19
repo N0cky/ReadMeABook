@@ -24,6 +24,16 @@ export function stackExecSync(service: string, argv: string[], { user, input }: 
   });
 }
 
+/** `docker compose logs --no-color <service>` via the exec bridge (read-only). Untainted runs only. */
+export function stackLogsSync(service: string): string {
+  if (!execBridgeAvailable()) throw new Error(EXEC_BRIDGE_SKIP);
+  return execFileSync(process.execPath, [path.join(__dirname, 'exec-client.cjs')], {
+    encoding: 'utf8',
+    input: JSON.stringify({ op: 'logs', service }),
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
 export function env(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is not set: run specs through e2e/run.mjs`);

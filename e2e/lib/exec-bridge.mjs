@@ -17,9 +17,15 @@ const USER_RE = /^(?:\d{1,6}(?::\d{1,6})?|[a-z_][a-z0-9_-]{0,31})$/;
 const MAX_BODY = 32 * 1024 * 1024;
 const EXEC_TIMEOUT_MS = 180_000;
 
+/**
+ * Two operations: `exec` (default; argv in a service, optional user/stdin) and `logs` (read-only
+ * `docker compose logs --no-color <service>`).
+ */
 export function validateExec(body) {
   if (!body || typeof body !== 'object') throw new Error('body must be an object');
   if (!SERVICES.has(body.service)) throw new Error(`service must be one of ${[...SERVICES].join(', ')}`);
+  if (body.op === 'logs') return { op: 'logs', service: body.service };
+  if (body.op !== undefined && body.op !== 'exec') throw new Error('op must be exec or logs');
   if (body.user !== undefined && !USER_RE.test(String(body.user))) throw new Error('invalid user');
   if (!Array.isArray(body.argv) || body.argv.length === 0 || body.argv.length > 64 || !body.argv.every((a) => typeof a === 'string' && a.length < 65536)) {
     throw new Error('argv must be 1-64 strings');
@@ -28,9 +34,10 @@ export function validateExec(body) {
   return body;
 }
 
-function execInStack({ project, env, tainted }, { service, user, argv, input }) {
+function execInStack({ project, env, tainted }, { op, service, user, argv, input }) {
   return new Promise((resolve) => {
-    const args = composeArgs(project, ['exec', '-T', ...(user ? ['-u', String(user)] : []), service, ...argv], { tainted, overrides: env.E2E_OVERRIDES });
+    const sub = op === 'logs' ? ['logs', '--no-color', service] : ['exec', '-T', ...(user ? ['-u', String(user)] : []), service, ...argv];
+    const args = composeArgs(project, sub, { tainted, overrides: env.E2E_OVERRIDES });
     const child = spawn('docker', args, { env: childEnv(env), stdio: ['pipe', 'pipe', 'pipe'] });
     const out = [];
     const err = [];
@@ -69,7 +76,7 @@ export async function startExecBridge({ project, env }) {
         res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: error.message }));
         return;
       }
-      log(`exec-bridge: ${body.service}${body.user ? ` -u ${body.user}` : ''} ${body.argv.join(' ').slice(0, 120)}`);
+      log(body.op === 'logs' ? `exec-bridge: logs ${body.service}` : `exec-bridge: ${body.service}${body.user ? ` -u ${body.user}` : ''} ${body.argv.join(' ').slice(0, 120)}`);
       const result = await execInStack({ project, env, tainted: false }, body);
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(result));
     });
