@@ -15,7 +15,7 @@ Recovers from the "Invalid username or password" failure mode caused by a lost o
 ```
 docker exec -it <container-name> npm run rmab:recover
 ```
-- `-it` is required for the interactive prompts
+- `-it` is required: without a terminal on stdin and stdout the script exits (code 2) before doing anything
 - Or directly: `docker exec -it <container-name> node /app/scripts/recover-credentials.js`
 
 ## What It Does
@@ -23,6 +23,7 @@ docker exec -it <container-name> npm run rmab:recover
 2. Diagnoses key health by attempting to decrypt an existing encrypted Configuration row
 3. Lists local users (`authProvider='local'`, not soft-deleted); prompts for one
 4. Prompts for new password twice (masked); validates length unless `ALLOW_WEAK_PASSWORD=true`
+   - Prompts: `scripts/lib/terminal-prompt.js`. Questions use a short-lived readline closed before returning; the password is read in raw mode with no readline attached, so it is never echoed (one `*` per character). Raw mode is restored on Enter, Ctrl+C/Ctrl+D (exit 130, "Cancelled. No changes made."), SIGTERM/SIGHUP and process exit
 5. Prints the exact plan (mode + what will be cleared); requires typing `confirm` verbatim
 6. Executes inside a single Prisma `$transaction`
 7. If key was rotated: writes new key to `/app/config/.secrets` and `/etc/environment`
@@ -68,6 +69,12 @@ docker exec -it <container-name> npm run rmab:recover
 ## Failure Modes
 - DB transaction fails → no changes committed, safe to re-run
 - DB transaction commits but `.secrets`/`/etc/environment` write fails → script prints the new key in plaintext with instructions for manual write (one-time exposure in operator's terminal)
+
+## Fixed Issues
+
+**Typed password echoed on screen**
+- **Cause:** the readline interface for the username prompt stayed open (only paused) while the hidden password prompt put stdin in raw mode; readline's keypress handling still echoed each character
+- **Fix:** prompts moved to `scripts/lib/terminal-prompt.js` (no readline alive during the hidden read); tests drive a fake TTY and assert the password never reaches stdout (`tests/scripts/terminal-prompt.test.ts`)
 
 ## Related
 - `backend/services/auth.md` — local auth flow + the decrypt-then-compare path

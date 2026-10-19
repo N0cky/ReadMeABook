@@ -17,8 +17,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const readline = require('readline');
 const bcrypt = require('bcrypt');
+const { createPrompter, CANCELLED } = require('./lib/terminal-prompt');
 
 const SECRETS_FILE = '/app/config/.secrets';
 const ENVIRONMENT_FILE = '/etc/environment';
@@ -228,56 +228,15 @@ function generateNewKey() {
 // ---------------------------------------------------------------------------
 // Prompt helpers
 // ---------------------------------------------------------------------------
-function ask(rl, question) {
-  return new Promise((resolve) => rl.question(question, (answer) => resolve(answer)));
-}
+// Prompts live in ./lib/terminal-prompt.js (no readline left attached while a password is typed)
+const prompter = createPrompter();
 
-function askHidden(question) {
-  return new Promise((resolve, reject) => {
-    if (!process.stdin.isTTY) {
-      reject(new Error('Interactive password input requires a TTY. Run with: docker exec -it ...'));
-      return;
-    }
-    process.stdout.write(question);
-    const stdin = process.stdin;
-    const wasRaw = stdin.isRaw;
-    stdin.setRawMode(true);
-    stdin.resume();
-    stdin.setEncoding('utf8');
-
-    let buffer = '';
-    const onData = (chunk) => {
-      for (const ch of chunk) {
-        if (ch === '\u0003') {
-          // Ctrl+C
-          stdin.setRawMode(wasRaw);
-          stdin.pause();
-          stdin.removeListener('data', onData);
-          process.stdout.write('\n');
-          reject(new Error('Cancelled by user'));
-          return;
-        }
-        if (ch === '\r' || ch === '\n') {
-          stdin.setRawMode(wasRaw);
-          stdin.pause();
-          stdin.removeListener('data', onData);
-          process.stdout.write('\n');
-          resolve(buffer);
-          return;
-        }
-        if (ch === '\u007f' || ch === '\b') {
-          if (buffer.length > 0) {
-            buffer = buffer.slice(0, -1);
-            process.stdout.write('\b \b');
-          }
-          continue;
-        }
-        if (ch < ' ') continue;
-        buffer += ch;
-        process.stdout.write('*');
-      }
-    };
-    stdin.on('data', onData);
+// Never leave the terminal in raw mode, whatever ends the process
+process.on('exit', () => prompter.close());
+for (const [signal, code] of [['SIGTERM', 143], ['SIGHUP', 129]]) {
+  process.once(signal, () => {
+    prompter.close();
+    process.exit(code);
   });
 }
 
@@ -325,6 +284,13 @@ async function main() {
   // Reject any CLI args by design.
   if (process.argv.length > 2) {
     console.error('This script does not accept CLI arguments. All input is via interactive prompts.');
+    console.error('Run: docker exec -it <container> npm run rmab:recover');
+    process.exit(2);
+  }
+
+  // Interactive only: without a terminal the password prompt cannot hide input
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('This script is interactive and needs a terminal (stdin and stdout).');
     console.error('Run: docker exec -it <container> npm run rmab:recover');
     process.exit(2);
   }
@@ -448,11 +414,9 @@ async function main() {
     }
     console.log('');
 
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
     let chosenUser = null;
     while (!chosenUser) {
-      const typed = (await ask(rl, '  Username to reset: ')).trim().toLowerCase();
+      const typed = (await prompter.ask('  Username to reset: ')).trim().toLowerCase();
       if (!typed) continue;
       chosenUser = localUsers.find((u) => u.plexUsername === typed);
       if (!chosenUser) {
@@ -470,10 +434,8 @@ async function main() {
 
     let newPassword = null;
     while (!newPassword) {
-      rl.pause();
-      const a = await askHidden('  New password: ');
-      const b = await askHidden('  Confirm new password: ');
-      rl.resume();
+      const a = await prompter.askHidden('  New password: ');
+      const b = await prompter.askHidden('  Confirm new password: ');
       if (a !== b) {
         console.log('  Passwords did not match. Try again.');
         continue;
@@ -535,14 +497,12 @@ async function main() {
     }
 
     console.log('');
-    const confirm = (await ask(rl, "  Type 'confirm' to proceed (anything else aborts): ")).trim();
+    const confirm = (await prompter.ask("  Type 'confirm' to proceed (anything else aborts): ")).trim();
     if (confirm !== 'confirm') {
       console.log('  Aborted. No changes made.');
-      rl.close();
       await prisma.$disconnect();
       process.exit(0);
     }
-    rl.close();
 
     // -------------------------------------------------------------------------
     // Execute
@@ -734,6 +694,12 @@ async function main() {
     }
     console.log('');
   } catch (err) {
+    if (err && err.code === CANCELLED) {
+      console.error('');
+      console.error('Cancelled. No changes made.');
+      process.exitCode = 130;
+      return;
+    }
     console.error('');
     console.error('ERROR: Recovery aborted.');
     console.error(`  ${err.message}`);
