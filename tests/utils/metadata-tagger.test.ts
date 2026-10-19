@@ -116,6 +116,18 @@ describe('metadata tagger', () => {
     expect(argv[fIdx + 1]).toBe('mp4');
   });
 
+  it.each(['/tmp/book.m4b', '/tmp/book.mp3', '/tmp/book.flac'])(
+    'stops on the first ffmpeg error (-xerror) when tagging %s',
+    async (file) => {
+      fsMock.access.mockResolvedValue(undefined);
+      mockExecFileSuccess('done');
+
+      await tagAudioFileMetadata(file, { title: 'Book', author: 'Author' });
+
+      expect(lastCallArgv()[0]).toBe('-xerror');
+    }
+  );
+
   it('tags an mp3 file with mp3 output format', async () => {
     fsMock.access.mockResolvedValue(undefined);
     mockExecFileSuccess('done');
