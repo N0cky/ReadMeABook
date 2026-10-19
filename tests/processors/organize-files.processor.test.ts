@@ -3,7 +3,7 @@
  * Documentation: documentation/phase3/file-organization.md
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPrismaMock } from '../helpers/prisma';
 import { generateFilesHash } from '@/lib/utils/files-hash';
 
@@ -44,6 +44,11 @@ vi.mock('@/lib/services/job-queue.service', () => ({
 vi.mock('@/lib/utils/format-coercion', () => formatCoercionMock);
 
 describe('processOrganizeFiles', () => {
+  // The processor's first import is slow under a loaded parallel run; pay it once here
+  beforeAll(async () => {
+    await import('@/lib/processors/organize-files.processor');
+  }, 60000);
+
   beforeEach(() => {
     vi.clearAllMocks();
     // Default mock for request lookup (processor needs to determine request type)

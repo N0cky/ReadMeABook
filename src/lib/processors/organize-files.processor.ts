@@ -16,6 +16,8 @@ import { PathMapper, PathMappingConfig } from '../utils/path-mapper';
 import { generateFilesHash } from '../utils/files-hash';
 import { fixEpubForKindle, cleanupFixedEpub } from '../utils/epub-fixer';
 import { cleanupDirectDownloadSource, cleanupDownloadAfterOrganize, cleanupSourceAfterOrganize } from './organize-cleanup';
+import { planDownloadCleanup } from './organize-cleanup-guard';
+import { ebookInventory, type ImportEvidence, unverifiedRecords } from '../utils/import-inventory';
 import { getAudibleService } from '../integrations/audible.service';
 import { addAutoBlock } from '../services/blocklist.service';
 
@@ -181,6 +183,9 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
     // Get file organizer (reads media_dir from database config)
     const organizer = await getFileOrganizer();
 
+    // Byte-compare existing library files only when a delete will depend on it
+    const compareExisting = await deleteMayFollow(requestId, downloadPath, downloadHistoryId, cleanupSource);
+
     // Read path template from configuration
     const templateConfig = await prisma.configuration.findUnique({
       where: { key: 'audiobook_path_template' },
@@ -215,7 +220,8 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
       template,
       jobId ? { jobId, context: 'FileOrganizer' } : undefined,
       renameConfig,
-      selectedFiles
+      selectedFiles,
+      { compareExisting }
     );
 
     if (!result.success) {
@@ -261,12 +267,26 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
       },
     });
 
+    const evidence: ImportEvidence = {
+      records: result.records ?? [],
+      coverRecord: result.coverRecord,
+      inventory: result.inventory ?? { kind: 'audio', files: [], complete: false },
+    };
+    const missing = unverifiedRecords(evidence);
+    const partialMessage = missing.length > 0
+      ? `${missing.length} of ${evidence.records.length} files not imported; source files kept`
+      : null;
+    if (partialMessage) {
+      logger.warn(`${partialMessage}: ${missing.map((r) => `${path.basename(r.source)} (${r.status})`).join(', ')}`);
+    }
+
     // Update request to downloaded (green status, waiting for Plex scan)
     await prisma.request.update({
       where: { id: requestId },
       data: {
         status: 'downloaded',
         progress: 100,
+        errorMessage: partialMessage,
         completedAt: new Date(),
         updatedAt: new Date(),
       },
@@ -345,6 +365,7 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
       downloadPath,
       downloadHistoryId,
       targetPath: result.targetPath,
+      evidence,
       configService,
       jobId,
       logger,
@@ -352,7 +373,7 @@ export async function processOrganizeFiles(payload: OrganizeFilesPayload): Promi
 
     // Cleanup source files if requested (manual import feature)
     if (cleanupSource) {
-      await cleanupSourceAfterOrganize(downloadPath, result.targetPath, configService, jobId, logger, selectedFiles);
+      await cleanupSourceAfterOrganize(downloadPath, result.targetPath, configService, jobId, logger, evidence, selectedFiles);
     }
 
     return {
@@ -848,7 +869,8 @@ async function processEbookOrganization(
     template,
     jobId ? { jobId, context: 'FileOrganizer.Ebook' } : undefined,
     isIndexerDownload,
-    ebookRenameConfig
+    ebookRenameConfig,
+    { compareExisting: await deleteMayFollow(requestId, downloadPath, downloadHistoryId, cleanupSource) }
   );
 
   // Clean up fixed EPUB temp file after organization (regardless of success)
@@ -936,6 +958,13 @@ async function processEbookOrganization(
     logger.debug(`Ebook library scan disabled (scanEnabled=${scanEnabled})`);
   }
 
+  // The organizer reads a temp copy when the Kindle fix ran; the original is epubFilePath
+  const importedFile = fixedEpubPath ? epubFilePath : result.sourceFile;
+  const ebookEvidence: ImportEvidence = {
+    records: result.record && importedFile ? [{ ...result.record, source: importedFile }] : [],
+    inventory: await ebookInventory(downloadPath),
+  };
+
   // Remove a direct HTTP download file now that it is in the library
   if (!isIndexerDownload) {
     await cleanupDirectDownloadSource({
@@ -943,6 +972,7 @@ async function processEbookOrganization(
       downloadPath,
       downloadHistoryId,
       targetPath: result.targetPath,
+      evidence: ebookEvidence,
       configService,
       jobId,
       logger,
@@ -955,6 +985,7 @@ async function processEbookOrganization(
     downloadPath,
     downloadHistoryId,
     targetPath: result.targetPath,
+    evidence: ebookEvidence,
     configService,
     jobId,
     logger,
@@ -964,12 +995,10 @@ async function processEbookOrganization(
   // file that was imported is removed, never the folder around it: an import
   // folder can also hold an audiobook or other library content.
   if (cleanupSource) {
-    // The organizer reads a temp copy when the Kindle fix ran; the original is epubFilePath
-    const importedFile = fixedEpubPath ? epubFilePath : result.sourceFile;
     if (!importedFile) {
       logger.warn('Imported ebook file unknown, skipping source cleanup');
     } else if (path.resolve(importedFile) === path.resolve(downloadPath)) {
-      await cleanupSourceAfterOrganize(downloadPath, result.targetPath, configService, jobId, logger);
+      await cleanupSourceAfterOrganize(downloadPath, result.targetPath, configService, jobId, logger, ebookEvidence);
     } else {
       await cleanupSourceAfterOrganize(
         downloadPath,
@@ -977,6 +1006,7 @@ async function processEbookOrganization(
         configService,
         jobId,
         logger,
+        ebookEvidence,
         [path.relative(downloadPath, importedFile)]
       );
     }
@@ -1137,6 +1167,31 @@ async function applyPostImportCategory(
 // =========================================================================
 // HELPER FUNCTIONS
 // =========================================================================
+
+/**
+ * True when this job may delete source files after organizing (manual
+ * cleanupSource, or a download that cleanup would remove). Only then are
+ * same-size existing library files compared byte-for-byte.
+ */
+async function deleteMayFollow(
+  requestId: string,
+  downloadPath: string,
+  downloadHistoryId: string | undefined,
+  cleanupSource: boolean | undefined
+): Promise<boolean> {
+  if (cleanupSource === true) {
+    return true;
+  }
+  try {
+    const plan = await planDownloadCleanup(requestId, downloadPath, downloadHistoryId, () =>
+      getConfigService().get('prowlarr_indexers')
+    );
+    return plan !== null;
+  } catch {
+    // Unknown: compare, so a later delete is never based on an unchecked file
+    return true;
+  }
+}
 
 /**
  * Detect the path to an EPUB file from download path

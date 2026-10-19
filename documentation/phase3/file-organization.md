@@ -228,7 +228,7 @@ When user deletes and re-requests the same audiobook:
 
 ## Post-Organize Cleanup Safety
 
-**Code:** `src/lib/processors/organize-cleanup.ts`, `src/lib/utils/delete-guard.ts`
+**Code:** `src/lib/processors/organize-cleanup.ts`, `src/lib/processors/organize-cleanup-guard.ts`, `src/lib/utils/delete-guard.ts`, `src/lib/utils/import-inventory.ts`
 
 **Download cleanup** (indexer `removeAfterProcessing`, non-torrent) runs only when all hold:
 - Job payload carries `downloadHistoryId` (set by monitor-download, retry-failed-imports, direct-download, request retry route; never by manual or bulk import)
@@ -245,9 +245,9 @@ When user deletes and re-requests the same audiobook:
 | c | Inside `media_dir`, unless inside a download root that itself sits strictly inside `media_dir` (`allowMediaSources` bypasses c for `cleanupSource` files only; a whole folder inside `media_dir` is never removed) |
 
 - Comparison: realpath of candidate, target and roots (symlinks, junctions), plus dev+inode identity of the entry and its ancestors (case-insensitive mounts). Inode 0 never matches.
-- Acts on the path the guard returns (the canonical path it checked). For a symlink candidate the rules check the link's target and only the link is removed; the link's own location is not checked against the rules.
-- Fail closed: roots are read straight from the database (`download_dir`, `download_clients`, legacy mapped path; no cache, no swallowed errors). Any database, decryption or JSON error → nothing is deleted (job still succeeds).
-- Empty-parent sweep: bounded by the nearest configured root containing the deleted path; never removes a root (download_dir, client customPath / mapped localPath, media_dir, bookdrop) and never climbs from a download root into `media_dir`.
+- Acts on the path the guard returns (the canonical path it checked). For a symlink candidate the rules are applied to both the link's target and the link's own location (canonical parent + name, lstat identity); only the link is removed. A library entry that is a link to a seeding file is therefore refused.
+- Fail closed: roots are read straight from the database (`download_dir`, `download_clients`, legacy mapped path; no cache, no swallowed errors). Any database, decryption or JSON error, or any root that is a filesystem root, → nothing is deleted (job still succeeds).
+- Empty-parent sweep: walks up to the nearest ancestor that is a configured root (canonical path or dev+inode match) and stops there, never removing it. No sweep when no ancestor is a root, or when the nearest root is only a client's mapped `localPath` (a mapped path that is also `download_dir` still sweeps).
 - `cleanupSource` + `selectedFiles`: each file is checked; files inside the target are kept and listed in a warning (in-place renamed re-imports keep the old-named file).
 - Ebook `cleanupSource` removes only the imported ebook file (`result.sourceFile`; the original EPUB when the Kindle fix ran), never its folder.
 - Direct HTTP download files (`downloadClient = direct`) are removed by `cleanupDirectDownloadSource` (same provenance gate + guard); the organizer itself never deletes its source.
@@ -256,6 +256,38 @@ When user deletes and re-requests the same audiobook:
 - `media_dir` resolution shared via `src/lib/utils/media-dir.ts` (`media_dir` → `MEDIA_DIR` → `/media/audiobooks`).
 
 **Same-file copies:** `copyFile` is a no-op when source and destination are the same file (`isSameFile`: realpath equal, or same dev + non-zero inode); the organizer skips audio and cover art already in place.
+
+## Verified Import (delete only what reached the library)
+
+**Code:** `src/lib/utils/copy-file.ts`, `src/lib/utils/organize-copy.ts`, `src/lib/utils/import-inventory.ts`
+
+**Atomic copy (`copyFile`):** writes `<target dir>/.rmab-partial-<sha256(name)[:12]>-<rand>.part` through one FileHandle (write, fsync, close all fatal) → size must equal the source → `rename` over the target → final path must have that size and the partial's dev/ino (when ino ≠ 0) → best-effort directory fsync (EINVAL/ENOTSUP/EISDIR/EBADF/EPERM/EACCES ignored). Failed rename (EXDEV, EBUSY, EACCES, …) = failed; never falls back to writing the final name. A crash leaves only a hidden `.part` file.
+
+**Stale partials:** before placing, regular files in that one target folder matching the exact pattern are removed when they belong to this target name or are older than 24 h.
+
+**`placeFile(source, target)` statuses** (records keyed on the original source path):
+
+| Existing target | Status |
+|-----------------|--------|
+| none | `copied` |
+| not a regular file (symlink, dir) | `differs`, never overwritten |
+| same regular file (hard link ok) | `identical` |
+| smaller and a byte-prefix of the source (interrupted copy) | re-copied → `copied` |
+| smaller, not a prefix (other book, edited tags) | `differs` |
+| same size | `identical` / `differs` by chunked compare when a delete depends on it, else `present` |
+| larger | `differs` |
+
+- `.mp4` / `.m4a` targets also match an existing `<name>.m4b` (Plex format coercion rename).
+- Tagged derivative (`<source>.tmp`, ffmpeg `-xerror`): verified only if the placed file's ffprobe duration is within 1 s of the original's; otherwise (or on probe failure) the original is placed untagged (byte-checked). A derivative that fails or differs falls back to the original.
+- Chapter merge: inputs map to the merged target; verified only if the merged duration is within min(2%, half the shortest chapter) of the chapters' total (`MergeResult.durationVerified`). Otherwise the merged file and all sources are kept. `-xerror` is used for re-encoding merges only: codec-copy concatenation of AAC chapters routinely logs non-monotonic DTS at chapter boundaries, which `-xerror` turns into a failed merge.
+- Compare cost: same-size compares run only when a delete may follow (manual `cleanupSource`, or a download that cleanup would remove); they stop at the first differing chunk.
+
+**Deletes consume the records (`ImportEvidence`):**
+- Selected files (`cleanupSource` + `selectedFiles`): only those with a verified record (`copied`/`identical`); others are kept and listed in a warning.
+- Whole folder or file (download cleanup, `cleanupSource` without selection, direct download): inventory complete (every source folder readable) and every audio file found in it verified; then a fresh walk right before removal must be complete and find no audio (or ebook) file the import never saw. Otherwise the download is kept and `postProcess` (client history archive) is skipped.
+- Ebook folders: kept when they hold more ebook files than were imported.
+- Only audio (or the ebook) is verified: non-audio extras (cover, nfo, samples) go with the folder.
+- Partial imports are visible: the request keeps status `downloaded` with `errorMessage` `"<n> of <m> files not imported; source files kept"` (shown amber in the admin requests table); a full import clears `errorMessage`.
 
 ## Interface
 
@@ -303,6 +335,7 @@ async function organize(
 **6. Invalid URL error for cached cover art** - Fixed by detecting local cached thumbnails (`/api/cache/thumbnails/*`) and copying from `/app/cache/thumbnails/` instead of attempting HTTP download
 **7. Manual import deleted library folders (#242)** - Download cleanup used the request's newest download row regardless of origin and `rm -rf`'d the import folder (even the media root); `cleanupSource` with source == target unlinked the library files; in-place re-import truncated `cover.jpg` to 0 bytes. Fixed by provenance gate + delete guard + same-file copy skip (see Post-Organize Cleanup Safety)
    - Upgrade note: organize jobs queued before this change carry no `downloadHistoryId`, so they skip download cleanup once (files stay on disk, client history entry is not archived). Their import retry on transient errors is unchanged; only manual/bulk imports fail without retry
+**8. Cleanup after partial or interrupted imports** - A download was removed when at least one file copied, an interrupted copy left a truncated file under the final name that later counted as done, and a same-named existing file skipped the copy while the source was still deleted. Fixed by atomic copies, per-file placement records and verified-only deletes (see Verified Import)
 
 ## Tech Stack
 
