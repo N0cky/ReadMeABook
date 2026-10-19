@@ -7,4 +7,5 @@
 !playwright.config.ts
 !bootstrap.ts
 !lib/harness.ts
+!lib/exec-client.cjs
 !specs/**

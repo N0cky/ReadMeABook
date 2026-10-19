@@ -11,7 +11,7 @@ WORKDIR /harness
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY tsconfig.json playwright.config.ts bootstrap.ts ./
-COPY lib/harness.ts lib/
+COPY lib/harness.ts lib/exec-client.cjs lib/
 COPY specs/ specs/
 RUN mkdir /evidence && chown -R pwuser:pwuser /evidence /harness
 USER pwuser

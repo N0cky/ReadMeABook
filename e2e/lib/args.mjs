@@ -15,6 +15,7 @@ export const USAGE = `usage:
        [--tainted [--pr-dockerfile]] [--dockerfile <file>] [--specs <a,b>] [--scenario <name>]
        [--backend abs|plex] [--upgrade-from <release tag, e.g. 1.2.3>] [--evidence <dir>]
        [--offline-fixtures] [--rm-image] [--allow-log-canary] [--isolation-check] [--allow-untracked]
+       [--overrides <name,name>]   (trusted e2e/overrides/*.yml; untainted only)
   node e2e/run.mjs unit --slug <s> --worktree <dir> [--evidence <dir>]
   node e2e/run.mjs preview --image <ref> [--replace-image <ref>] [--evidence <dir>]
   node e2e/run.mjs down --slug <s> [--force-reserved]`;
@@ -84,6 +85,7 @@ export function parseArgs(argv) {
     if (opts.command !== 'stack' || !opts.worktree) throw new Error('--tainted applies to stack runs with --worktree');
     if (opts.dockerfile) throw new Error('--tainted builds with the trusted dockerfile.unified; use --pr-dockerfile for the branch Dockerfile');
     if (opts['upgrade-from']) throw new Error('--upgrade-from is not supported with --tainted');
+    if (opts.overrides) throw new Error('--overrides is not allowed with --tainted');
   }
   if (opts['pr-dockerfile'] && !opts.tainted) throw new Error('--pr-dockerfile only applies with --tainted');
   return opts;

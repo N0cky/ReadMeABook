@@ -75,12 +75,25 @@ export function run(cmd, args, { capture = false, allowFail = false, env, input,
   return capture ? (res.stdout || '').trim() : res.status ?? 1;
 }
 
-export function composeArgs(project, args, { tainted = false } = {}) {
-  return ['compose', '-p', project, '-f', COMPOSE_FILE, ...(tainted ? ['-f', TAINTED_FILE] : []), '--env-file', ENV_FILE, ...args];
+export const OVERRIDES_DIR = path.join(E2E_DIR, 'overrides');
+
+/** Trusted compose overrides by name (e2e/overrides/<name>.yml); untainted runs only. */
+export function overrideFiles(names) {
+  return String(names || '').split(',').map((n) => n.trim()).filter(Boolean).map((n) => {
+    if (!/^[a-z0-9-]+$/.test(n)) throw new Error(`invalid override name ${n}`);
+    const file = path.join(OVERRIDES_DIR, `${n}.yml`);
+    if (!fs.existsSync(file)) throw new Error(`unknown override ${n} (see e2e/overrides/)`);
+    return file;
+  });
+}
+
+export function composeArgs(project, args, { tainted = false, overrides = '' } = {}) {
+  const extra = overrideFiles(overrides).flatMap((f) => ['-f', f]);
+  return ['compose', '-p', project, '-f', COMPOSE_FILE, ...extra, ...(tainted ? ['-f', TAINTED_FILE] : []), '--env-file', ENV_FILE, ...args];
 }
 
 export function compose(project, args, env, opts = {}) {
-  return run('docker', composeArgs(project, args, { tainted: env?.E2E_TAINTED === '1' }), { env, ...opts });
+  return run('docker', composeArgs(project, args, { tainted: env?.E2E_TAINTED === '1', overrides: env?.E2E_OVERRIDES }), { env, ...opts });
 }
 
 export function imageExists(ref) {

@@ -27,6 +27,7 @@ import {
   stableRowCounts, tableRowCounts, compareUpgradeCounts, EXACT_TABLES,
 } from './lib/runner.mjs';
 import { fetchAndLoad } from './lib/fetch-image.mjs';
+import { startExecBridge } from './lib/exec-bridge.mjs';
 
 const RELEASE_REPO = 'ghcr.io/kikootwo/readmeabook';
 const UNIT_TIMEOUT_MS = 30 * 60_000;
@@ -54,6 +55,7 @@ function stackEnv(opts, token) {
     FIXTURE_METADATA: opts['offline-fixtures'] ? 'test/offline-metadata.json' : '',
     CONTROL_TOKEN: token,
     E2E_TAINTED: opts.tainted ? '1' : '0',
+    E2E_OVERRIDES: opts.overrides || '',
   };
 }
 
@@ -67,6 +69,10 @@ function runnerEnv(ctx) {
     E2E_ABS_URL: 'http://abs:80',
     E2E_BACKEND: ctx.opts.backend,
     E2E_EVIDENCE_DIR: '/evidence',
+    E2E_RMAB_IMAGE: ctx.env.RMAB_IMAGE,
+    E2E_TAINTED_RUN: ctx.opts.tainted ? '1' : '0',
+    // Untainted runs only: the host exec bridge (docker exec into the stack for trusted specs).
+    ...(ctx.bridge ? { E2E_EXEC_BRIDGE_URL: ctx.bridge.url, E2E_EXEC_TOKEN: ctx.bridge.token } : {}),
   };
 }
 
@@ -77,8 +83,8 @@ function up(ctx, rmabImage, { generatedSecrets = false } = {}) {
 }
 
 /** Run one Playwright phase; harness errors (no bootstrap) become exit 2. */
-function playwright(ctx, specs, phase, extraEnv = {}) {
-  const { status, bootstrapped } = runPlaywright({ image: ctx.runner, project: ctx.project, evidence: ctx.evidence, env: { ...runnerEnv(ctx), ...extraEnv }, specs, phase });
+async function playwright(ctx, specs, phase, extraEnv = {}) {
+  const { status, bootstrapped } = await runPlaywright({ image: ctx.runner, project: ctx.project, evidence: ctx.evidence, env: { ...runnerEnv(ctx), ...extraEnv }, specs, phase });
   if (status !== 0 && !bootstrapped) throw new HarnessError(`bootstrap failed in phase ${phase} (see results-${phase}.json / test-results-${phase})`);
   return status === 0 ? 0 : 1;
 }
@@ -141,7 +147,7 @@ async function upgradeFlow(ctx, image) {
   ctx.summary.upgradeFrom = oldRef;
   // Phase 1: release image on fresh volumes with image-generated secrets (the real upgrade path).
   up(ctx, oldRef, { generatedSecrets: true });
-  let status = playwright(ctx, ['upgrade.spec.ts'], 'upgrade-seed');
+  let status = await playwright(ctx, ['upgrade.spec.ts'], 'upgrade-seed');
   if (status !== 0) return status;
   const before = await stableRowCounts(ctx, EXACT_TABLES);
   fs.mkdirSync(path.join(ctx.evidence, 'upgrade'), { recursive: true });
@@ -152,7 +158,7 @@ async function upgradeFlow(ctx, image) {
   // Phase 2: branch image on the same volumes.
   up(ctx, image, { generatedSecrets: true });
   const statuses = JSON.parse(fs.readFileSync(path.join(ctx.evidence, 'upgrade', 'before.json'), 'utf8')).statuses;
-  status = playwright(ctx, ['upgrade.spec.ts'], 'upgrade-verify', { E2E_UPGRADE_BEFORE: JSON.stringify({ statuses }) });
+  status = await playwright(ctx, ['upgrade.spec.ts'], 'upgrade-verify', { E2E_UPGRADE_BEFORE: JSON.stringify({ statuses }) });
   const after = tableRowCounts(ctx);
   fs.writeFileSync(path.join(ctx.evidence, 'upgrade', 'after-counts.json'), JSON.stringify(after, null, 2));
   const problems = compareUpgradeCounts(before, after);
@@ -199,11 +205,15 @@ async function stackOrPreview(opts) {
     compose(project, ['down', '-v', '--remove-orphans'], ctx.env, { allowFail: true }); // fresh volumes every run
     const image = await obtainImages(ctx);
     if (interrupted) throw new HarnessError('interrupted');
+    if (!opts.tainted) {
+      ctx.bridge = await startExecBridge({ project, env: ctx.env });
+      ctx.summary.execBridge = `on (127.0.0.1:${ctx.bridge.port})`;
+    } else ctx.summary.execBridge = 'off (tainted)';
     if (opts['upgrade-from']) status = await upgradeFlow(ctx, image);
     else {
       up(ctx, image);
       const specs = opts.command === 'preview' ? ['preview-seed.spec.ts'] : opts.specs.split(',').map((s) => s.trim());
-      status = playwright(ctx, specs, opts.command === 'preview' ? 'preview' : 'stack');
+      status = await playwright(ctx, specs, opts.command === 'preview' ? 'preview' : 'stack');
       if (opts.tainted || opts['isolation-check']) {
         const probes = isolationProbes({ project, env: ctx.env });
         fs.writeFileSync(path.join(evidence, 'isolation.json'), JSON.stringify(probes, null, 2));
@@ -218,6 +228,7 @@ async function stackOrPreview(opts) {
     status = error instanceof HarnessError ? 2 : status === 0 ? 2 : status;
     if (ctx.runner || ctx.env.RMAB_IMAGE !== 'unset') saveLogs(ctx, 'compose.log');
   } finally {
+    if (ctx.bridge) await ctx.bridge.close();
     ctx.summary.imageSizes = Object.fromEntries(ctx.sizeRefs.filter(imageExists).map((ref) => [ref, imageSize(ref)]));
     if (opts.command === 'preview') {
       // The preview stays up. The old image goes only if the new preview is healthy.

@@ -10,7 +10,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { E2E_DIR, LABEL, run, compose, log } from './docker.mjs';
+import { spawn } from 'node:child_process';
+import { E2E_DIR, LABEL, run, compose, log, childEnv } from './docker.mjs';
 
 const RUNNER_TIMEOUT_MS = 45 * 60_000;
 
@@ -38,7 +39,7 @@ export function buildRunnerImage(slug, { allowUntracked = false } = {}) {
  * Run Playwright in a fresh runner container and copy /evidence out. Returns
  * { status, bootstrapped } where bootstrapped=false means globalSetup never finished (harness error).
  */
-export function runPlaywright({ image, project, evidence, env, specs, phase }) {
+export async function runPlaywright({ image, project, evidence, env, specs, phase }) {
   const name = `${project}-runner-${Date.now()}`;
   // Env goes through a file so tokens/creds never appear in commands.log or `ps`.
   const envFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'rmab-e2e-env-')), 'runner.env');
@@ -55,7 +56,15 @@ export function runPlaywright({ image, project, evidence, env, specs, phase }) {
     ], { quiet: false });
     run('docker', ['network', 'connect', `${project}_control`, name]);
     log(`$ playwright test ${specs.join(' ')} (container ${name}, phase ${phase})`);
-    status = run('docker', ['start', '-a', name], { allowFail: true, timeoutMs: RUNNER_TIMEOUT_MS });
+    // Async: the host exec bridge (untainted runs) must keep serving while the runner works.
+    status = await new Promise((resolve) => {
+      const child = spawn('docker', ['start', '-a', name], { env: childEnv(), stdio: 'inherit' });
+      const timer = setTimeout(() => child.kill(), RUNNER_TIMEOUT_MS);
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve(code ?? 1);
+      });
+    });
     run('docker', ['cp', `${name}:/evidence/.`, evidence], { allowFail: true });
     bootstrapped = fs.existsSync(path.join(evidence, 'bootstrap-ok'));
     fs.rmSync(path.join(evidence, 'bootstrap-ok'), { force: true });

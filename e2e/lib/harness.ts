@@ -5,6 +5,24 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+/** True when run.mjs started the exec bridge (untainted runs only). */
+export const execBridgeAvailable = () => Boolean(process.env.E2E_EXEC_BRIDGE_URL && process.env.E2E_EXEC_TOKEN);
+export const EXEC_BRIDGE_SKIP = 'needs the exec bridge (docker exec into the stack), which run.mjs only provides for untainted runs';
+
+/**
+ * Run argv inside a stack service (rmab | fake-arr | abs) via the host exec bridge, synchronously.
+ * Throws like execFileSync on a non-zero exit. Untainted runs only.
+ */
+export function stackExecSync(service: string, argv: string[], { user, input }: { user?: string; input?: string } = {}): string {
+  if (!execBridgeAvailable()) throw new Error(EXEC_BRIDGE_SKIP);
+  return execFileSync(process.execPath, [path.join(__dirname, 'exec-client.cjs')], {
+    encoding: 'utf8',
+    input: JSON.stringify({ service, user, argv, input }),
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
 
 export function env(name: string): string {
   const value = process.env[name];
@@ -133,7 +151,8 @@ export interface Recorded {
   added?: { hash?: string; nzoId?: string; releaseId: string | null }[];
 }
 
-const ctl = (p: string, init: RequestInit = {}) =>
+/** fetch() against fake-arr /__control (adds the per-run control token). */
+export const ctl = (p: string, init: RequestInit = {}) =>
   fetch(`${urls.control()}/__control${p}`, { ...init, headers: { 'x-control-token': env('E2E_CONTROL_TOKEN'), ...(init.headers || {}) } });
 
 /** fake-arr control API client (token-protected; RMAB never has the token). */
