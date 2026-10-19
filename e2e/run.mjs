@@ -3,225 +3,240 @@
  * Component: E2E harness runner (stack / unit / preview / down)
  * Documentation: documentation/testing/e2e-harness.md
  *
- * Run from a TRUSTED checkout. The branch under test is passed with --worktree and is only ever
- * used as a Docker build context. Cleanup runs after every stack/unit run, including failures.
+ * Run from a TRUSTED checkout. A branch is passed with --worktree and only ever used as a Docker build
+ * context; Playwright runs in the pinned runner container. Cleanup runs after every stack/unit run,
+ * including failures. Exit codes: 0 pass, 1 spec/assertion failure, 2 harness error (build, compose,
+ * image fetch, bootstrap), 130 interrupted.
  *
- *   npm run e2e -- --slug <s> --port <3401-3499> (--image <ref> | --worktree <dir>) [options]
+ *   npm run e2e -- --slug <s> --port <3401-3499> (--image <ref> | --worktree <dir> [--tainted]) [options]
  *   npm run e2e:unit -- --slug <s> --worktree <dir>
  *   npm run e2e -- preview --image <ref> [--replace-image <old ref>]
  *   npm run e2e -- down --slug <s>
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  E2E_DIR, PREVIEW_PROJECT, LABEL, run, compose, composePort, readEnvFile, imageExists, imageSize,
-  buildRmabImage, gitShortSha, enforceDiskCeiling, cleanupRun, dockerDf, setCommandLog,
+  E2E_DIR, REPO, LABEL, PREVIEW_PROJECT, run, compose, readEnvFile, imageExists, imageSize, isHarnessImage,
+  removeHarnessImage, buildRmabImage, gitShortSha, enforceDiskCeiling, cleanupRun, dockerDf, setCommandLog, childEnv, log,
 } from './lib/docker.mjs';
+import { parseArgs, evidenceDir, USAGE } from './lib/args.mjs';
+import {
+  newControlToken, buildRunnerImage, runPlaywright, saveRecorder, canaryLines, isolationProbes,
+  stableRowCounts, tableRowCounts, compareUpgradeCounts, EXACT_TABLES,
+} from './lib/runner.mjs';
 import { fetchAndLoad } from './lib/fetch-image.mjs';
 
-const REPO = path.dirname(E2E_DIR);
-const PLAYWRIGHT_CLI = path.join(REPO, 'node_modules', '@playwright', 'test', 'cli.js');
 const RELEASE_REPO = 'ghcr.io/kikootwo/readmeabook';
+const UNIT_TIMEOUT_MS = 30 * 60_000;
 
-const USAGE = `usage:
-  node e2e/run.mjs [stack] --slug <s> --port <3401-3499> (--image <ref> | --worktree <dir>)
-       [--dockerfile <file>] [--specs <a,b>] [--scenario <name>] [--backend abs|plex]
-       [--upgrade-from <release tag, e.g. 1.2.3>] [--evidence <dir>] [--offline-fixtures] [--rm-image]
-  node e2e/run.mjs unit --slug <s> --worktree <dir> [--evidence <dir>]
-  node e2e/run.mjs preview --image <ref> [--replace-image <ref>] [--evidence <dir>]
-  node e2e/run.mjs down --slug <s>`;
+class HarnessError extends Error {}
 
-function parseArgs(argv) {
-  const opts = { command: 'stack', specs: 'smoke.spec.ts', backend: 'abs', scenario: 'smoke' };
-  const flags = new Set(['offline-fixtures', 'rm-image', 'help']);
-  let i = 0;
-  if (argv[0] && !argv[0].startsWith('--')) opts.command = argv[i++];
-  for (; i < argv.length; i++) {
-    const key = argv[i].replace(/^--/, '');
-    if (flags.has(key)) opts[key] = true;
-    else if (argv[i].startsWith('--') && argv[i + 1] !== undefined) opts[key] = argv[++i];
-    else throw new Error(`bad argument ${argv[i]}\n${USAGE}`);
-  }
-  if (opts.help) {
-    console.log(USAGE);
-    process.exit(0);
-  }
-  if (!['stack', 'unit', 'preview', 'down'].includes(opts.command)) throw new Error(`unknown command ${opts.command}\n${USAGE}`);
-  if (opts.command === 'preview') {
-    opts.slug = 'preview';
-    opts.port = '3400';
-  }
-  if (!/^[a-z0-9][a-z0-9-]{0,40}$/.test(opts.slug || '')) throw new Error(`--slug must match [a-z0-9-] (got ${opts.slug})`);
-  if (opts.command === 'stack') {
-    const port = Number(opts.port);
-    if (!(port >= 3401 && port <= 3499)) throw new Error('--port must be in 3401-3499 (3400 is the preview)');
-    if (!opts.image === !opts.worktree) throw new Error('pass exactly one of --image or --worktree');
-  }
-  if (opts.command === 'unit' && !opts.worktree) throw new Error('unit needs --worktree');
-  if (opts.command === 'preview' && !opts.image) throw new Error('preview needs --image');
-  if (!['abs', 'plex'].includes(opts.backend)) throw new Error('--backend must be abs or plex');
-  if (opts.worktree) {
-    opts.worktree = path.resolve(opts.worktree);
-    if (!fs.existsSync(path.join(opts.worktree, 'package.json'))) throw new Error(`--worktree ${opts.worktree} is not a checkout`);
-  }
-  return opts;
-}
-
-function evidenceDir(opts) {
-  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '');
-  const base = path.resolve(opts.evidence || process.env.E2E_EVIDENCE_DIR || path.join(os.tmpdir(), 'rmab-e2e-evidence'));
-  const dir = path.join(base, `${opts.slug}-${opts.command}-${stamp}`);
-  // Evidence must never land inside a build context.
-  for (const ctx of [opts.worktree, E2E_DIR].filter(Boolean)) {
-    const rel = path.relative(ctx, dir);
-    if (!rel.startsWith('..') && !path.isAbsolute(rel)) throw new Error(`evidence dir ${dir} is inside build context ${ctx}`);
-  }
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-function playwright(env, specs, project) {
-  const args = [PLAYWRIGHT_CLI, 'test', '-c', path.join(E2E_DIR, 'playwright.config.ts'), ...specs];
-  if (project) args.push('--project', project);
-  console.log(`[e2e] $ playwright test ${specs.join(' ')}${project ? ` --project ${project}` : ''}`);
-  const res = spawnSync(process.execPath, args, { cwd: REPO, stdio: 'inherit', env: { ...process.env, ...env } });
-  return res.status ?? 1;
-}
-
-async function saveRecorder(controlUrl, file) {
-  try {
-    const res = await fetch(`${controlUrl}/__control/requests`);
-    fs.writeFileSync(file, JSON.stringify(await res.json(), null, 2));
-  } catch (error) {
-    fs.writeFileSync(file, JSON.stringify({ error: String(error) }));
-  }
-}
-
-/** Logs, recorder dump, canary count, image sizes, disk usage. Never throws. */
-async function collectEvidence(ctx) {
-  try {
-    const logs = compose(ctx.project, ['logs', '--no-color', '--timestamps'], ctx.env, { capture: true, allowFail: true, quiet: true });
-    fs.writeFileSync(path.join(ctx.evidence, 'compose.log'), logs);
-    const key = ctx.secrets.PROWLARR_API_KEY;
-    const rmabLines = logs.split(/\r?\n/).filter((l) => l.startsWith('rmab'));
-    ctx.summary.canaryInRmabLogs = rmabLines.filter((l) => l.includes(key)).length;
-    if (ctx.controlUrl) await saveRecorder(ctx.controlUrl, path.join(ctx.evidence, 'fake-arr-requests.json'));
-  } catch (error) {
-    ctx.summary.evidenceError = String(error);
-  }
-  ctx.summary.imageSizes = Object.fromEntries(ctx.sizeRefs.filter(imageExists).map((ref) => [ref, imageSize(ref)]));
-}
-
-function upStack(ctx, rmabImage, { generatedSecrets = false } = {}) {
-  const env = { ...ctx.env, RMAB_IMAGE: rmabImage };
-  if (generatedSecrets) Object.assign(env, { RMAB_JWT_SECRET: '', RMAB_JWT_REFRESH_SECRET: '', RMAB_CONFIG_ENCRYPTION_KEY: '', RMAB_POSTGRES_PASSWORD: '' });
-  compose(ctx.project, ['up', '-d', '--no-build'], env);
-  ctx.env = env;
-  ctx.controlUrl = composePort(ctx.project, 'fake-arr', 9999, env);
-  const absUrl = composePort(ctx.project, 'abs', 80, env);
-  return {
-    ...ctx.secrets,
-    E2E_PROJECT: ctx.project,
-    E2E_SLUG: ctx.opts.slug,
-    E2E_BASE_URL: `http://127.0.0.1:${ctx.opts.port}`,
-    E2E_CONTROL_URL: ctx.controlUrl,
-    E2E_ABS_URL: absUrl,
-    E2E_BACKEND: ctx.opts.backend,
-    E2E_EVIDENCE_DIR: ctx.evidence,
-    E2E_COMPOSE_ENV: JSON.stringify({ E2E_SLUG: env.E2E_SLUG, RMAB_IMAGE: env.RMAB_IMAGE, RMAB_PORT: env.RMAB_PORT }),
+/** SIGINT/SIGTERM: remember, let the current child exit, then the caller's finally cleans up. */
+function trapSignals(onSignal) {
+  const handler = () => onSignal();
+  process.on('SIGINT', handler);
+  process.on('SIGTERM', handler);
+  return () => {
+    process.off('SIGINT', handler);
+    process.off('SIGTERM', handler);
   };
+}
+
+function stackEnv(opts, token) {
+  return {
+    E2E_SLUG: opts.slug,
+    RMAB_PORT: opts.port,
+    RMAB_IMAGE: 'unset',
+    E2E_SCENARIO: opts.scenario,
+    FAKE_ARR_TAG: opts.slug,
+    FIXTURE_METADATA: opts['offline-fixtures'] ? 'test/offline-metadata.json' : '',
+    CONTROL_TOKEN: token,
+    E2E_TAINTED: opts.tainted ? '1' : '0',
+  };
+}
+
+function runnerEnv(ctx) {
+  return {
+    ...readEnvFile(),
+    E2E_SLUG: ctx.opts.slug,
+    E2E_BASE_URL: 'http://rmab:3030',
+    E2E_CONTROL_URL: 'http://fake-arr:9999',
+    E2E_CONTROL_TOKEN: ctx.token,
+    E2E_ABS_URL: 'http://abs:80',
+    E2E_BACKEND: ctx.opts.backend,
+    E2E_EVIDENCE_DIR: '/evidence',
+  };
+}
+
+function up(ctx, rmabImage, { generatedSecrets = false } = {}) {
+  ctx.env.RMAB_IMAGE = rmabImage;
+  if (generatedSecrets) Object.assign(ctx.env, { RMAB_JWT_SECRET: '', RMAB_JWT_REFRESH_SECRET: '', RMAB_CONFIG_ENCRYPTION_KEY: '', RMAB_POSTGRES_PASSWORD: '' });
+  if (compose(ctx.project, ['up', '-d', '--no-build'], ctx.env, { allowFail: true }) !== 0) throw new HarnessError('compose up failed');
+}
+
+/** Run one Playwright phase; harness errors (no bootstrap) become exit 2. */
+function playwright(ctx, specs, phase, extraEnv = {}) {
+  const { status, bootstrapped } = runPlaywright({ image: ctx.runner, project: ctx.project, evidence: ctx.evidence, env: { ...runnerEnv(ctx), ...extraEnv }, specs, phase });
+  if (status !== 0 && !bootstrapped) throw new HarnessError(`bootstrap failed in phase ${phase} (see results-${phase}.json / test-results-${phase})`);
+  return status === 0 ? 0 : 1;
+}
+
+function saveLogs(ctx, file) {
+  const logs = compose(ctx.project, ['logs', '--no-color', '--timestamps'], ctx.env, { capture: true, allowFail: true, quiet: true });
+  fs.writeFileSync(path.join(ctx.evidence, file), logs);
+  return logs;
+}
+
+async function obtainImages(ctx) {
+  const { opts } = ctx;
+  let image = opts.image;
+  if (image) {
+    if (!imageExists(image)) throw new HarnessError(`image ${image} not found locally`);
+    if (opts['rm-image']) {
+      if (!isHarnessImage(image)) throw new HarnessError(`--rm-image refused: ${image} has no ${LABEL} label`);
+      ctx.created.push(image);
+    }
+  } else {
+    image = `rmab-e2e/${opts.slug}:${gitShortSha(opts.worktree)}`;
+    ctx.created.push(image);
+    // Tainted: trusted dockerfile.unified from this checkout unless --pr-dockerfile (then no network).
+    const dockerfile = opts.tainted && !opts['pr-dockerfile'] ? path.join(REPO, 'dockerfile.unified') : path.resolve(opts.dockerfile || path.join(opts.worktree, 'dockerfile.unified'));
+    ctx.summary.dockerfile = dockerfile;
+    try {
+      buildRmabImage({ worktree: opts.worktree, dockerfile, tag: image, slug: opts.slug, network: opts['pr-dockerfile'] ? 'none' : undefined });
+    } catch (error) {
+      throw new HarnessError(`image build failed: ${error.message}`);
+    }
+  }
+  ctx.summary.image = image;
+  ctx.sizeRefs.push(image);
+  if (compose(ctx.project, ['build', 'fake-arr'], ctx.env, { allowFail: true }) !== 0) throw new HarnessError('fake-arr build failed');
+  ctx.created.push(`rmab-e2e/fake-arr:${opts.slug}`);
+  try {
+    ctx.runner = buildRunnerImage(opts.slug, { allowUntracked: !!opts['allow-untracked'] });
+  } catch (error) {
+    throw new HarnessError(error.message);
+  }
+  ctx.created.push(ctx.runner);
+  ctx.sizeRefs.push(`rmab-e2e/fake-arr:${opts.slug}`, ctx.runner);
+  return image;
+}
+
+async function upgradeFlow(ctx, image) {
+  const oldRef = `${RELEASE_REPO}:${ctx.opts['upgrade-from'].replace(/^v/, '')}`;
+  if (!imageExists(oldRef)) {
+    if (run('docker', ['pull', oldRef], { allowFail: true }) !== 0) {
+      ctx.warn(`docker pull ${oldRef} failed; fetching it over the registry API (digest-verified)`);
+      try {
+        await fetchAndLoad(oldRef);
+      } catch (error) {
+        throw new HarnessError(`could not obtain ${oldRef}: ${error.message}`);
+      }
+    }
+    ctx.pulled.push(oldRef);
+  }
+  ctx.sizeRefs.push(oldRef);
+  ctx.summary.upgradeFrom = oldRef;
+  // Phase 1: release image on fresh volumes with image-generated secrets (the real upgrade path).
+  up(ctx, oldRef, { generatedSecrets: true });
+  let status = playwright(ctx, ['upgrade.spec.ts'], 'upgrade-seed');
+  if (status !== 0) return status;
+  const before = await stableRowCounts(ctx, EXACT_TABLES);
+  fs.mkdirSync(path.join(ctx.evidence, 'upgrade'), { recursive: true });
+  fs.writeFileSync(path.join(ctx.evidence, 'upgrade', 'before-counts.json'), JSON.stringify(before, null, 2));
+  saveLogs(ctx, 'compose-phase1.log'); // before the old container is removed
+  compose(ctx.project, ['stop', 'rmab'], ctx.env);
+  compose(ctx.project, ['rm', '-f', 'rmab'], ctx.env);
+  // Phase 2: branch image on the same volumes.
+  up(ctx, image, { generatedSecrets: true });
+  const statuses = JSON.parse(fs.readFileSync(path.join(ctx.evidence, 'upgrade', 'before.json'), 'utf8')).statuses;
+  status = playwright(ctx, ['upgrade.spec.ts'], 'upgrade-verify', { E2E_UPGRADE_BEFORE: JSON.stringify({ statuses }) });
+  const after = tableRowCounts(ctx);
+  fs.writeFileSync(path.join(ctx.evidence, 'upgrade', 'after-counts.json'), JSON.stringify(after, null, 2));
+  const problems = compareUpgradeCounts(before, after);
+  ctx.summary.upgradeRowCounts = problems.length ? { ok: false, problems } : { ok: true };
+  return problems.length ? 1 : status;
+}
+
+async function finish(ctx, status) {
+  const logs = saveLogs(ctx, 'compose.log');
+  saveRecorder({ project: ctx.project, env: ctx.env, token: ctx.token, file: path.join(ctx.evidence, 'fake-arr-requests.json') });
+  const leaks = canaryLines(logs, readEnvFile().PROWLARR_API_KEY);
+  ctx.summary.canaryInRmabLogs = leaks.slice(0, 20);
+  if (leaks.length && status === 0) {
+    if (ctx.opts['allow-log-canary']) ctx.warn(`${leaks.length} rmab log line(s) contain the Prowlarr canary key (allowed by --allow-log-canary)`);
+    else {
+      ctx.summary.error = `${leaks.length} rmab log line(s) contain the Prowlarr API key canary`;
+      status = 1;
+    }
+  }
+  return status;
 }
 
 async function stackOrPreview(opts) {
   const evidence = evidenceDir(opts);
   setCommandLog(path.join(evidence, 'commands.log'));
   const project = opts.command === 'preview' ? PREVIEW_PROJECT : `rmab-e2e-${opts.slug}`;
-  const fakeArrRef = `rmab-e2e/fake-arr:${opts.slug}`;
+  const token = newControlToken();
   const ctx = {
-    opts, evidence, project, controlUrl: null, sizeRefs: [], created: [],
-    secrets: readEnvFile(),
-    env: { E2E_SLUG: opts.slug, RMAB_PORT: opts.port, RMAB_IMAGE: 'unset', E2E_SCENARIO: opts.scenario, FAKE_ARR_TAG: opts.slug, FIXTURE_METADATA: opts['offline-fixtures'] ? 'test/offline-metadata.json' : '' },
-    summary: { command: opts.command, slug: opts.slug, project, startedAt: new Date().toISOString(), warnings: [] },
+    opts, evidence, project, token, runner: null, sizeRefs: [], created: [], pulled: [], env: stackEnv(opts, token),
+    summary: { command: opts.command, slug: opts.slug, project, tainted: !!opts.tainted, startedAt: new Date().toISOString(), warnings: [] },
   };
-  const warn = (msg) => {
-    console.warn(`[e2e] WARNING ${msg}`);
+  ctx.warn = (msg) => {
+    log(`WARNING ${msg}`);
     ctx.summary.warnings.push(msg);
   };
   let interrupted = false;
-  const onSignal = () => {
+  const untrap = trapSignals(() => {
     interrupted = true;
-    warn('interrupted: cleaning up');
-  };
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
-
-  let status = 1;
+    ctx.warn('interrupted: cleaning up');
+  });
+  let status = 2;
   try {
-    ctx.summary.dfBefore = enforceDiskCeiling({ slug: opts.slug, protect: opts.image ? [opts.image] : [], warn }).total.toFixed(1);
+    ctx.summary.dfBeforeGB = enforceDiskCeiling({ slug: opts.slug, protect: opts.image ? [opts.image] : [], warn: ctx.warn }).total.toFixed(1);
     compose(project, ['down', '-v', '--remove-orphans'], ctx.env, { allowFail: true }); // fresh volumes every run
-
-    let image = opts.image;
-    if (image) {
-      if (!imageExists(image)) throw new Error(`image ${image} not found locally`);
-      // A supplied image is kept unless --rm-image (e.g. a fail-before base image built for this run only).
-      if (opts.command === 'stack' && opts['rm-image']) ctx.created.push(image);
-    } else {
-      image = `rmab-e2e/${opts.slug}:${gitShortSha(opts.worktree)}`;
-      ctx.created.push(image);
-      buildRmabImage({ worktree: opts.worktree, dockerfile: opts.dockerfile && path.resolve(opts.dockerfile), tag: image, slug: opts.slug });
-    }
-    ctx.sizeRefs.push(image, fakeArrRef);
-    ctx.summary.image = image;
-    if (interrupted) throw new Error('interrupted');
-
-    compose(project, ['build', 'fake-arr'], ctx.env);
-    ctx.created.push(fakeArrRef);
-
-    if (opts['upgrade-from']) {
-      const oldRef = `${RELEASE_REPO}:${opts['upgrade-from'].replace(/^v/, '')}`;
-      const hadOld = imageExists(oldRef);
-      if (!hadOld && run('docker', ['pull', oldRef], { allowFail: true }) !== 0) {
-        warn(`docker pull ${oldRef} failed; fetching it over the registry API (digest-verified)`);
-        await fetchAndLoad(oldRef);
-      }
-      if (!hadOld) ctx.created.push(oldRef);
-      ctx.sizeRefs.push(oldRef);
-      ctx.summary.upgradeFrom = oldRef;
-      // Phase 1: last release on fresh volumes with image-generated secrets (the real upgrade path).
-      let pwEnv = upStack(ctx, oldRef, { generatedSecrets: true });
-      status = playwright({ ...pwEnv, E2E_PHASE: 'upgrade-seed' }, ['upgrade.spec.ts'], 'chromium');
-      if (status !== 0 || interrupted) throw new Error('upgrade seed phase failed');
-      compose(project, ['stop', 'rmab'], ctx.env);
-      compose(project, ['rm', '-f', 'rmab'], ctx.env);
-      // Phase 2: branch image on the same volumes.
-      pwEnv = upStack(ctx, image, { generatedSecrets: true });
-      status = playwright({ ...pwEnv, E2E_PHASE: 'upgrade-verify' }, ['upgrade.spec.ts'], 'chromium');
-    } else {
-      const pwEnv = upStack(ctx, image);
+    const image = await obtainImages(ctx);
+    if (interrupted) throw new HarnessError('interrupted');
+    if (opts['upgrade-from']) status = await upgradeFlow(ctx, image);
+    else {
+      up(ctx, image);
       const specs = opts.command === 'preview' ? ['preview-seed.spec.ts'] : opts.specs.split(',').map((s) => s.trim());
-      status = playwright({ ...pwEnv, E2E_PHASE: opts.command }, specs, 'chromium');
+      status = playwright(ctx, specs, opts.command === 'preview' ? 'preview' : 'stack');
+      if (opts.tainted || opts['isolation-check']) {
+        const probes = isolationProbes({ project, env: ctx.env });
+        fs.writeFileSync(path.join(evidence, 'isolation.json'), JSON.stringify(probes, null, 2));
+        ctx.summary.isolation = probes.map((p) => `${p.ok ? 'ok' : 'FAIL'} ${p.name}: ${p.got} (want ${p.expect})`);
+        if (probes.some((p) => !p.ok) && status === 0) status = 1;
+      }
     }
+    status = await finish(ctx, status);
   } catch (error) {
-    console.error(`[e2e] ${error.message}`);
+    log(error.message);
     ctx.summary.error = error.message;
-    if (status === 0) status = 2;
+    status = error instanceof HarnessError ? 2 : status === 0 ? 2 : status;
+    if (ctx.runner || ctx.env.RMAB_IMAGE !== 'unset') saveLogs(ctx, 'compose.log');
   } finally {
-    await collectEvidence(ctx);
+    ctx.summary.imageSizes = Object.fromEntries(ctx.sizeRefs.filter(imageExists).map((ref) => [ref, imageSize(ref)]));
     if (opts.command === 'preview') {
-      // The preview stays up; only the replaced preview image is removed.
-      if (opts['replace-image'] && opts['replace-image'] !== opts.image) run('docker', ['image', 'rm', opts['replace-image']], { allowFail: true });
+      // The preview stays up. The old image goes only if the new preview is healthy.
+      const healthy = status === 0 && compose(project, ['exec', '-T', 'rmab', 'curl', '-sf', 'http://localhost:3030/api/health'], ctx.env, { allowFail: true, quiet: true, capture: true }) !== '';
+      if (opts['replace-image'] && opts['replace-image'] !== opts.image) {
+        if (healthy) removeHarnessImage(opts['replace-image'], ctx.warn);
+        else ctx.warn(`kept ${opts['replace-image']}: new preview is not healthy`);
+      }
+      for (const ref of ctx.created.filter((r) => r.startsWith('rmab-e2e/runner:'))) removeHarnessImage(ref, ctx.warn);
     } else {
-      cleanupRun({ project, env: ctx.env, images: ctx.created });
+      cleanupRun({ project, env: ctx.env, images: ctx.created, pulled: ctx.pulled, warn: ctx.warn });
     }
     const df = dockerDf();
-    fs.writeFileSync(path.join(evidence, 'docker-df.txt'), `${df.raw}\n`);
-    Object.assign(ctx.summary, { status, finishedAt: new Date().toISOString(), dfAfterGB: df.total.toFixed(1), removedImages: opts.command === 'preview' ? [] : ctx.created });
-    if (df.total > 50) warn(`docker system df still ${df.total.toFixed(1)} GB after cleanup`);
+    fs.writeFileSync(path.join(evidence, 'docker-df.txt'), `${df.table}\n`);
+    if (interrupted) status = 130;
+    Object.assign(ctx.summary, { status, finishedAt: new Date().toISOString(), dfAfterGB: df.total.toFixed(1), removedImages: opts.command === 'preview' ? [] : [...ctx.created, ...ctx.pulled] });
     fs.writeFileSync(path.join(evidence, 'summary.json'), `${JSON.stringify(ctx.summary, null, 2)}\n`);
-    console.log(`[e2e] ${status === 0 ? 'PASS' : 'FAIL'} — evidence: ${evidence}`);
+    log(`${status === 0 ? 'PASS' : 'FAIL'} (exit ${status}) — evidence: ${evidence}`);
+    untrap();
   }
   return status;
 }
@@ -230,28 +245,50 @@ function unit(opts) {
   const evidence = evidenceDir(opts);
   setCommandLog(path.join(evidence, 'commands.log'));
   const tag = `rmab-e2e/${opts.slug}-unit:${gitShortSha(opts.worktree)}`;
-  let status = 1;
+  const name = `rmab-e2e-${opts.slug}-unit-${Date.now()}`;
+  let status = 2;
+  let interrupted = false;
+  const untrap = trapSignals(() => {
+    interrupted = true;
+    run('docker', ['rm', '-f', name], { allowFail: true, quiet: true });
+  });
   try {
-    // Harness-owned Dockerfile (+ Dockerfile.test.dockerignore) from this trusted checkout; the worktree is context only.
-    run('docker', ['build', '-f', path.join(E2E_DIR, 'Dockerfile.test'), '-t', tag, '--label', LABEL, '--label', `rmab-e2e.slug=${opts.slug}`, opts.worktree]);
-    const res = spawnSync('docker', ['run', '--rm', '--network', 'none', '--user', 'node', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '4096', tag], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
+    enforceDiskCeiling({ slug: `${opts.slug}-unit`, warn: (m) => log(`WARNING ${m}`) });
+    // Harness-owned Dockerfile + .dockerignore + engine fetcher from this trusted checkout; the worktree is context only.
+    const built = run('docker', ['build', '-f', path.join(E2E_DIR, 'Dockerfile.test'), '--build-context', `harness=${path.join(E2E_DIR, 'unit')}`, '-t', tag, '--label', LABEL, '--label', `rmab-e2e.slug=${opts.slug}-unit`, opts.worktree], { allowFail: true });
+    if (built !== 0) throw new HarnessError('unit image build failed');
+    const res = spawnSync('docker', [
+      'run', '--name', name, '--rm', '--network', 'none', '--user', 'node', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+      '--memory', '6g', '--cpus', '4', '--pids-limit', '4096', tag,
+    ], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, timeout: UNIT_TIMEOUT_MS, env: childEnv() });
     fs.writeFileSync(path.join(evidence, 'unit.log'), `${res.stdout || ''}\n${res.stderr || ''}`);
-    process.stdout.write((res.stdout || '').split(/\r?\n/).slice(-25).join('\n') + '\n');
-    status = res.status ?? 1;
+    process.stdout.write(`${(res.stdout || '').split(/\r?\n/).slice(-25).join('\n')}\n`);
+    if (res.error) throw new HarnessError(`unit run failed: ${res.error.message}`);
+    status = res.status === 0 ? 0 : 1;
   } catch (error) {
-    console.error(`[e2e] ${error.message}`);
+    log(error.message);
+    status = 2;
   } finally {
-    run('docker', ['image', 'rm', tag], { allowFail: true });
-    cleanupRun({ project: `rmab-e2e-${opts.slug}-unit`, env: { E2E_SLUG: `${opts.slug}-unit`, RMAB_IMAGE: 'unused', RMAB_PORT: '0' }, images: [] });
-    console.log(`[e2e] unit ${status === 0 ? 'PASS' : 'FAIL'} — log: ${path.join(evidence, 'unit.log')}`);
+    run('docker', ['rm', '-f', name], { allowFail: true, quiet: true });
+    removeHarnessImage(tag);
+    run('docker', ['image', 'prune', '-f', '--filter', `label=${LABEL}`], { allowFail: true });
+    if (interrupted) status = 130;
+    log(`unit ${status === 0 ? 'PASS' : 'FAIL'} (exit ${status}) — log: ${path.join(evidence, 'unit.log')}`);
+    untrap();
   }
   return status;
 }
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.help) {
+    console.log(USAGE);
+    return 0;
+  }
   if (opts.command === 'down') {
-    cleanupRun({ project: `rmab-e2e-${opts.slug}`, env: { E2E_SLUG: opts.slug, RMAB_IMAGE: 'unused', RMAB_PORT: '0' }, images: [`rmab-e2e/fake-arr:${opts.slug}`] });
+    const project = `rmab-e2e-${opts.slug}`;
+    const labelled = run('docker', ['images', '--filter', `label=rmab-e2e.slug=${opts.slug}`, '--format', '{{.Repository}}:{{.Tag}}'], { capture: true, allowFail: true, quiet: true }).split(/\r?\n/).filter(Boolean);
+    cleanupRun({ project, env: { E2E_SLUG: opts.slug, RMAB_IMAGE: 'unused', RMAB_PORT: '0', CONTROL_TOKEN: 'unused', E2E_TAINTED: '1' }, images: labelled });
     return 0;
   }
   if (opts.command === 'unit') return unit(opts);

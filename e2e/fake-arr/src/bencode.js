@@ -29,7 +29,7 @@ const PIECE_LENGTH = 256 * 1024;
  * files: [{ path: ['a.mp3'], length }]. Pieces are placeholder hashes: nothing verifies them.
  * Returns { buffer, infoHash } where infoHash is the lowercase hex SHA-1 of the bencoded info dict.
  */
-export function buildTorrent({ name, files, announce }) {
+export function buildTorrent({ name, files, announce, source }) {
   const total = files.reduce((sum, f) => sum + f.length, 0);
   const pieceCount = Math.max(1, Math.ceil(total / PIECE_LENGTH));
   const pieces = Buffer.concat(
@@ -40,6 +40,8 @@ export function buildTorrent({ name, files, announce }) {
     'piece length': PIECE_LENGTH,
     pieces,
     files: files.map((f) => ({ length: f.length, path: f.path })),
+    // `source` (as private trackers use it) makes the info-hash unique per release.
+    ...(source ? { source } : {}),
   };
   const infoHash = createHash('sha1').update(bencode(info)).digest('hex');
   const buffer = bencode({ announce, 'created by': 'rmab-e2e-fake-arr', info });
@@ -56,8 +58,8 @@ export function buildMagnet(hash, name, tracker) {
   return `magnet:?xt=urn:btih:${hash}&${params.toString()}`;
 }
 
-/** Minimal NZB document. */
-export function buildNzb({ name, files }) {
+/** Minimal NZB document; the release id is embedded so each release's NZB is unique. */
+export function buildNzb({ name, files, releaseId }) {
   const escape = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
   const fileXml = files
     .map(
@@ -70,6 +72,6 @@ export function buildNzb({ name, files }) {
     .join('\n');
   return Buffer.from(
     `<?xml version="1.0" encoding="UTF-8"?>\n<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">\n` +
-      `  <head><meta type="name">${escape(name)}</meta></head>\n${fileXml}\n</nzb>\n`
+      `  <head><meta type="name">${escape(name)}</meta><meta type="x-fake-arr-release">${escape(String(releaseId))}</meta></head>\n${fileXml}\n</nzb>\n`
   );
 }

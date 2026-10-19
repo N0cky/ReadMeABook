@@ -1,94 +1,110 @@
 # E2E Harness
 
-**Status:** ⏳ In Progress | Disposable per-branch Docker stack + Playwright, fakes for every *arr/download client
+**Status:** ⏳ In Progress | Disposable per-branch Docker stack; Playwright in a pinned container; fakes for every *arr/download client
 
 ## Overview
-`e2e/` stands up an isolated stack for any branch (RMAB image under test, real Audiobookshelf, `fake-arr`), bootstraps setup over the API, drives Chromium and the API, saves evidence, and tears everything down.
+`e2e/` stands up an isolated stack for any branch (RMAB image under test, real Audiobookshelf, `fake-arr`), bootstraps setup over the API, drives Chromium (inside a container) and the API, saves evidence, and tears everything down. `--tainted` adds network and privilege isolation for untrusted (external PR) code.
 
 ## Commands (run from a TRUSTED checkout)
 | Command | Does |
 |---|---|
 | `npm run e2e -- --slug <s> --port <3401-3499> --worktree <dir>` | Build `rmab-e2e/<s>:<sha>` from `<dir>`, run smoke, clean up |
-| `npm run e2e -- --slug <s> --port <p> --image <ref> [--rm-image]` | Use an existing image (kept unless `--rm-image`) |
+| `... --worktree <dir> --tainted [--pr-dockerfile]` | Untrusted code: trusted `dockerfile.unified`, isolated stack, isolation probes (required when `<dir>/.rmab-e2e-tainted` exists) |
+| `npm run e2e -- --slug <s> --port <p> --image <ref> [--rm-image]` | Existing image; `--rm-image` removes it afterwards only if labelled `rmab-e2e=true` |
 | `... --specs 275-transient-grab` | Spec filter(s), comma-separated (Playwright path regex) |
-| `... --dockerfile <file>` | Override the Dockerfile (e.g. old commit + current `dockerfile.unified`) |
-| `... --upgrade-from 1.2.3` | Upgrade test: `ghcr.io/kikootwo/readmeabook:1.2.3` (no `v`) → branch image, same volumes |
-| `... --backend plex` | Plex-mode setup against fake Plex + local admin |
-| `... --offline-fixtures` | Fixture metadata from `fixtures/test/offline-metadata.json` (no Audnexus) |
+| `... --dockerfile <file>` | Trusted runs only: override the Dockerfile (e.g. old commit + current `dockerfile.unified`) |
+| `... --upgrade-from 1.2.3` | `ghcr.io/kikootwo/readmeabook:1.2.3` (no `v`) → branch image on the same volumes |
+| `... --backend plex` | Plex-mode setup against fake Plex + local admin (Admin Login toggle) |
+| `... --offline-fixtures` | Fixture metadata from `fixtures/test/offline-metadata.json` (no Audnexus at build) |
+| `... --allow-log-canary` | Don't fail when RMAB logs contain the Prowlarr canary key (pre-fix images only) |
+| `... --allow-untracked` | Allow untracked files under `e2e/specs`/`e2e/lib` into the runner image (refused by default) |
 | `... --evidence <dir>` | Evidence root (default `$E2E_EVIDENCE_DIR` or `%TEMP%/rmab-e2e-evidence`); refused inside a build context |
 | `npm run e2e:unit -- --slug <s> --worktree <dir>` | Containerized `npm test` (mandatory for untrusted worktrees) |
-| `npm run e2e -- preview --image <ref> [--replace-image <old>]` | `rmab-e2e-preview` on 127.0.0.1:3400, seeded, no teardown |
-| `npm run e2e -- down --slug <s>` | Cleanup only |
-| `npm run e2e:selftest` | Host unit tests for fake-arr + fixture generator (needs ffmpeg/ffprobe) |
+| `npm run e2e -- preview --image <ref> [--replace-image <old>]` | `rmab-e2e-preview` on 127.0.0.1:3400, seeded, no teardown; old image removed only if the new preview is healthy |
+| `npm run e2e -- down --slug <s> [--force-reserved]` | Cleanup: stack, volumes, images labelled with the slug |
+| `npm run e2e:selftest` | Host unit tests: fake-arr, egress proxy, fixtures, fetch-image, args (needs ffmpeg/ffprobe) |
 
-- Exit code: 0 pass, 1 spec failure, 2 harness error. Evidence: `summary.json`, `commands.log`, `compose.log`, `fake-arr-requests.json`, `docker-df.txt`, `results*.json`, `report*/`, `test-results*/` (traces), per-spec screenshots/JSON.
-- Prereqs (host): Docker, Node ≥20, `npm ci`, `npx playwright install chromium` (Playwright `1.56.1`, Chromium only).
+- Exit codes: `0` pass; `1` spec/assertion failure (incl. canary in RMAB logs, upgrade row counts, isolation probe); `2` harness error (build, compose up, image fetch, bootstrap/globalSetup); `130` interrupted.
+- Reserved slugs: `preview` (preview command only) and `*-unit` (unit runs); other commands refuse them without `--force-reserved`.
+- `--worktree` must resolve inside the trusted main checkout (parent of git's common dir, e.g. `C:\GIT\ReadMeABook-maint`, incl. `.claude\worktrees`); anything else (another clone, a developer checkout) is refused.
+- Ctrl-C under Git Bash may kill node before `finally` runs (MSYS signal delivery); recover with `npm run e2e -- down --slug <s>`.
+- Host prereqs: Docker (BuildKit), Node ≥20, ffmpeg for `e2e:selftest`. No Playwright on the host; `cd e2e && npm ci` only for editor types / `npx tsc -p e2e`.
+- Evidence: `summary.json`, `commands.log`, `compose.log` (+ `compose-phase1.log` on upgrades), `fake-arr-requests.json`, `isolation.json` (tainted), `docker-df.txt`, `results-*.json`, `report-*/`, `test-results-*/` (traces), per-spec JPEGs/JSON.
 
-## Trust split
-- Harness code (`run.mjs`, `compose.yml`, specs, `Dockerfile.test` + `.dockerignore`) always comes from the trusted checkout; `--worktree` is only a Docker build context. Nothing in it runs on the host.
-- `e2e:unit` image: `node:20-bookworm` + the app's pinned static ffmpeg/ffprobe (ffmpeg tests run, not skip); `npm ci --ignore-scripts`, then only `npm rebuild @prisma/engines prisma bcrypt esbuild unrs-resolver`; `prisma generate` with `--network=none`; tests run `--network none --user node --cap-drop ALL`, no mounts.
+## Trust boundary
+- Harness code (`run.mjs`, `lib/`, compose files, specs, Dockerfiles + their `.dockerignore`s) always comes from the trusted checkout. Branch code runs only inside containers: the RMAB image build, the RMAB container, the unit container.
+- On the host: only `node` running trusted harness code, `docker`/`git` CLIs (minimal env: an OS/Docker passthrough allowlist + every `.env.test` key), and `docker exec` probes into the stack.
+- **Playwright/Chromium** run in `rmab-e2e/runner:<slug>` = `mcr.microsoft.com/playwright:v1.63.0-noble@sha256:eff16c…` + `e2e/package-lock.json` (`@playwright/test` 1.63.0) + harness files, as `pwuser`, `--cap-drop ALL`, `no-new-privileges`, 4 GB / 2048 pids, on the `stack` + `control` networks only, no mounts. Evidence leaves via `docker cp /evidence`. `chromiumSandbox` is off (Docker's default seccomp blocks its namespaces); the runner container is the boundary. `E2E_CHROMIUM_SANDBOX=1` turns it on for a seccomp profile that allows it.
+- **Unit image** (`e2e/Dockerfile.test`, `node:20-bookworm` + the app's pinned static ffmpeg): network only for `npm ci --ignore-scripts` (lockfile tarballs, integrity-checked) and the trusted `e2e/unit/fetch-prisma-engines.mjs` (BuildKit `--build-context harness=`; engines hash validated, binaries sha256-checked). Every step that can run branch or package code (`npm rebuild bcrypt esbuild unrs-resolver` from source, `prisma generate`) is `RUN --network=none`. Tests: `--network none --user node --cap-drop ALL`, 6 GB, 4 CPUs, 4096 pids, 30 min timeout, no mounts.
+- **Residual risk (tainted builds):** the trusted `dockerfile.unified` still runs the branch's `npm ci` lifecycle scripts and `next build` with network inside BuildKit (no host mounts or secrets). `--pr-dockerfile` builds with `--network none` (the stock Dockerfile can't build offline). Allowlisted metadata hosts are an outbound channel for the test stack's fake data only.
 
 ## Stack (`e2e/compose.yml`, project `rmab-e2e-<slug>`)
-| Service | Image | Host port |
-|---|---|---|
-| `rmab` | `${RMAB_IMAGE}` | `127.0.0.1:${RMAB_PORT}:3030` |
-| `abs` | `docker.io/advplyr/audiobookshelf:2.37.1@sha256:581d68…` (same index digest as ghcr) | `127.0.0.1::80` (ephemeral) |
-| `fake-arr` | `rmab-e2e/fake-arr:<slug>` (built, `node:20-alpine@sha256:fb4cd1…`) | `127.0.0.1::9999` (control, ephemeral) |
-- Named volumes only: `rmab-config`, `rmab-cache`, `pgdata`, `redis`, `downloads` (rmab+fake-arr), `media` (rmab+abs+fake-arr), `abs-config`, `abs-metadata`.
-- Ephemeral ports are read with `docker compose port`. fake-arr (root) chowns `/downloads`, `/media`, `/media/audiobooks` to `PUID:PGID` before RMAB starts (nothing in the RMAB image does).
-- Fixed fake values: `e2e/.env.test` (committed; `.gitignore` exception). `PROWLARR_API_KEY` is a canary. Upgrade runs pass empty `RMAB_*` secrets so the image generates and persists its own.
+| Service | Image | Networks | Host port |
+|---|---|---|---|
+| `rmab` | `${RMAB_IMAGE}` | `stack` | `127.0.0.1:${RMAB_PORT}:3030` (trusted runs only) |
+| `abs` | `docker.io/advplyr/audiobookshelf:2.37.1@sha256:581d68…` (= ghcr digest) | `stack` | none |
+| `fake-arr` | `rmab-e2e/fake-arr:<slug>` (`node:20-alpine@sha256:fb4cd1…`) | `stack` (+ alias `tracker.e2e`), `control` | none |
+| runner | `rmab-e2e/runner:<slug>` (per Playwright phase) | `stack`, `control` | none |
+- `control` is `internal`; every `/__control/*` call except `/health` needs `x-control-token` (random per run; given to fake-arr and the runner, never to RMAB). The host reads the recorder via `docker compose exec fake-arr wget`.
+- Named volumes only: `rmab-config`, `rmab-cache`, `pgdata`, `redis`, `downloads` (rmab+fake-arr), `media` (rmab+abs+fake-arr), `abs-config`, `abs-metadata`. fake-arr (root) chowns `/downloads`, `/media`, `/media/audiobooks` to `PUID:PGID` (nothing in the RMAB image does).
+- `PUBLIC_URL=http://rmab:3030` (the in-network browser's origin). Fixed fake values: `e2e/.env.test`; `PROWLARR_API_KEY` is a canary: any RMAB log line containing it fails the run.
 - Never use a developer's local `docker-compose.yml`, never `up` the repo-root compose file.
+
+## Tainted mode (`e2e/compose.tainted.yml`)
+- `stack` is `internal: true` (no gateway: no internet, LAN or host); RMAB is not published; `host.docker.internal` → `192.0.2.1` (TEST-NET).
+- Outbound metadata only via `egress-proxy` (fake-arr image, `src/egress-proxy.js`, on `stack` + `egress`): exact-host allowlist `EGRESS_ALLOW` (default `api.audible.com,www.audible.com,audible.com,api.audnex.us,m.media-amazon.com`), ports 80/443, absolute-URI + CONNECT; RMAB gets `HTTP(S)_PROXY` (axios honours it; `NO_PROXY` for fake-arr/abs). Every decision is a JSON line in `compose.log`.
+- Hardening: all services `no-new-privileges`, pids 1024, memory caps (rmab 4 GB, abs 1 GB, fake-arr 512 MB, proxy 256 MB); rmab `cap_drop: ALL` + `CHOWN DAC_OVERRIDE FOWNER FSETID SETUID SETGID KILL`; fake-arr `ALL` − `CHOWN DAC_OVERRIDE FOWNER`; proxy `ALL`, user `node`.
+- Isolation probes (in the rmab container, after the specs; `isolation.json`): `host.docker.internal`, Docker bridge gateway, common LAN gateways and `1.1.1.1` must not connect; fake-arr control without token → 401; proxy → 403 for a non-allowlisted host, 200 for `api.audnex.us`. Any miss fails the run.
 
 ## fake-arr (`e2e/fake-arr/`, zero dependencies)
 | Listener | Fakes | Endpoints (source in `src/lib/integrations/`) |
 |---|---|---|
-| `fake-arr:9696` | Prowlarr | `/api/v1/search` (prowlarr.service.ts:151), `/indexer` :268, `/health` :281, `/indexerstats` :294, `/system/status`, RSS `/{id}/api` :312, grab `/{id}/download?apikey&link&file` |
+| `fake-arr:9696` | Prowlarr | `/api/v1/search` (prowlarr.service.ts:151; honours `categories`, `limit`, `type`), `/indexer` :268, `/health` :281, `/indexerstats` :294, `/system/status`, RSS `/{id}/api` :312, grab `/{id}/download?apikey&link&file` |
 | `tracker.e2e:9797` / `fake-arr:9797` | foreign origin | `/d/<release>` direct link, `/t/<release>/<hop>` redirect hops, `/announce` |
 | `fake-arr:8081` | qBittorrent v2 | `auth/login`, `app/version`, `torrents/{categories,createCategory,editCategory,add,info,files,pause,resume,stop,start,setCategory,delete}` (qbittorrent.service.ts:194-:852) |
-| `fake-arr:8085` | SABnzbd | `/api?mode=version,get_config,set_config,addfile,queue[,delete],history[,delete],pause,resume` (sabnzbd.service.ts:155-:753) |
-| `fake-arr:32400` | Plex | `/identity`, `/library/sections`, `/sections/1/{all,search,refresh}`, `/library/metadata/<k>` (plex.service.ts:220-:794); plex.tv not faked |
+| `fake-arr:8085` | SABnzbd | `/api?mode=version,get_config,set_config,addfile,queue[&name=delete\|pause\|resume],history[&name=delete],pause,resume` (sabnzbd.service.ts:155-:753); `mode=pause/resume` = whole queue (as real SABnzbd) |
+| `fake-arr:32400` | Plex | `/identity`, `/library/sections`, `/sections/1/{all,search,refresh}`, `/library/metadata/<k>` (plex.service.ts:220-:794); trailing folder ASIN → `com.plexapp.agents.audible://<ASIN>` guid; plex.tv not faked |
 | `:9999` | control | `GET /__control/{health,scenarios,books,requests?since=,state,plex-library}`, `POST /__control/scenario {name}\|{definition}`, `POST /__control/reset` |
-- Grab key: query `apikey` or `X-Api-Key`; wrong/missing → 401. Recorder keeps every request: `seq, service, listener, host, method, path, query, headers, status, location, added[]`.
-- Downloads: progress from wall clock; non-zero `dlspeed` while moving; files copied into `<save_path>/<name>/` and chowned on the first poll at 100%, before reporting complete (`uploading` / SAB `Completed`).
+- Grab key: query `apikey` or `X-Api-Key`; wrong/missing → 401. Recorder: `seq, service, listener, host, method, path, query, headers, status, location, added[]`.
+- Scenario load replaces releases only; the recorder, client sessions/categories and in-flight downloads survive (so key-leak checks see bootstrap/setup traffic). `POST /__control/reset` clears everything.
+- Each release gets a unique info-hash / NZB (salted per scenario + release id), even when releases share a fixture.
+- Downloads: progress from wall clock; non-zero `dlspeed` while moving; files copied into `<save_path>/<name>/` and chowned on the first poll at 100%, before reporting complete; a finished torrent that is paused reports `pausedUP` at 100%.
 
 ## Scenarios (`e2e/scenarios/*.json`)
-- Release fields: `id`, `book`, `title` (`{{title}}`, `{{author}}`, `{{asin}}`, `{{narrator}}`), `protocol` torrent\|usenet, `indexerId`, `sizeMB` (keep ≥20: ranking drops <20 MB), `seeders`, `fixture`, `link: "magnet"`.
+- Release fields: `id`, `book`, `title` (`{{title}}`, `{{author}}`, `{{asin}}`, `{{narrator}}`), `protocol` torrent\|usenet, `indexerId`, `categories` (default `[3030]`), `sizeMB` (keep ≥20: ranking drops <20 MB), `seeders`, `fixture`, `link: "magnet"`.
 - `grab`: `statuses` (per attempt, last repeats, e.g. `[503]`), `redirects` (`other-port`\|`tracker`\|`relative`\|`magnet`, one per hop), `direct: true`, `body: "magnet-text"`.
 - `download`: `completeMs`, `stallAtPct` (0 B/s, `stalledDL`), `failAtPct` (`error` / SAB `Failed`), `dropFixture` (e.g. `wrong-files`).
-- Scenario-level `search.statuses` for transient Prowlarr search failures. Search matches releases containing every query word (≥3 chars).
+- Scenario-level `search.statuses` (transient search failures), `search.ignoreLimit` (indexer over-returns). Search matches releases containing every query word (≥3 chars).
 - Shipped: `smoke`, `transient-grab-503`, `usenet-smoke`, `stall`, `slow`, `wrong-files`, `failed-download`, `key-scope`, `preview`.
 
 ## Fixtures (`e2e/fixtures/`)
-- `manifest.json` references books by ASIN only; title/author/narrator come from Audnexus at generation time (`--metadata` for offline).
-- Generated at fake-arr image build (ffmpeg only in the builder stage): multi-file tagged mp3s (album/album_artist/composer/track), m4b with chapters, `Title [B0…]` folder, `wrong-files`. ~250 KB total.
+- `manifest.json` references books by ASIN only; title/author/narrator come from Audnexus at fake-arr image build (`--offline-fixtures` / `--metadata` for offline).
+- ffmpeg only in the builder stage: multi-file tagged mp3s (album/album_artist/composer/track), m4b with chapters, `Title [B0…]` folder, `wrong-files`. ~250 KB total.
 
-## Bootstrap (`e2e/bootstrap.ts`, Playwright globalSetup, idempotent)
+## Bootstrap (`e2e/bootstrap.ts`, Playwright globalSetup in the runner, idempotent)
 1. ABS: `/init` root user → `/login` → library `/media/audiobooks` → API key (`/api/api-keys`, legacy token fallback).
 2. Wait RMAB `/api/health`; `GET /api/setup/status`.
-3. `POST /api/setup/complete` (ABS mode + `authMethod: manual` + local admin; or Plex mode with fake Plex), both fake download clients, indexers 1 (torrent) and 2 (usenet). Already set up → admin login.
-4. Writes `<evidence>/auth.json`, `<evidence>/storage-state.json`.
+3. `POST /api/setup/complete` (ABS + `authMethod: manual` + `registration` + local admin; or Plex mode with fake Plex), both fake download clients, indexers 1 (torrent) and 2 (usenet). Already set up → admin login.
+4. Writes `auth.json`, `storage-state.json`, `bootstrap-ok` (missing marker + failed run → exit 2).
 
 ## Specs (`e2e/specs/`)
 | Spec | Asserts |
 |---|---|
-| `smoke.spec.ts` | (ABS or `--backend plex`: Admin Login toggle, fake Plex library, scan jobs) UI login → search → card Request → qBit add → downloaded → ABS item → `available` (recently-added job triggered) → "In Your Library"; canary never off the Prowlarr origin |
+| `smoke.spec.ts` | UI login (ABS form, or Plex-mode Admin Login toggle) → search → card Request → qBit add → downloaded → ABS item / fake Plex album → `available` (scan + recently-added jobs) → "In Your Library"; Prowlarr key never off the Prowlarr origin |
 | `regressions/275-transient-grab.spec.ts` | A's grab answered 503, then B fetched after it (fails here on pre-fix code), qBit got only B, request completes |
-| `upgrade.spec.ts` | Seed on release image; after upgrade: health, admin login, exact rows in users/audiobooks/requests/download_history/api_tokens/blocked_releases, no table shrinks, statuses kept, stored Prowlarr key decrypts |
+| `upgrade.spec.ts` | Seed (available/downloading/failed) on the release image; after upgrade: health, admin login, statuses kept, stored Prowlarr key decrypts. `run.mjs` adds exact host-side row counts: users/audiobooks/requests/download_history/api_tokens/blocked_releases unchanged (snapshot after counts settle), no table shrinks |
 | `preview-seed.spec.ts` | Preview has `available`, `downloading`, `failed` requests and one library book |
-- Helpers: `e2e/lib/harness.ts` (`Rmab`, `Abs`, `fakeArr`, `keyLeaks`, `waitFor`, `tableRowCounts` via `docker compose exec rmab gosu postgres psql`).
+- Helpers: `e2e/lib/harness.ts` (`Rmab`, `Abs`, `fakeArr`, `keyLeaks`, `waitFor`, `snap`). Host-side: `e2e/lib/runner.mjs` (runner container, recorder, canary, isolation probes, row counts).
 
-## Cleanup (every stack/unit run, in `finally`, incl. failures and Ctrl-C)
-- Before: disk ceiling (`docker system df` images+cache+volumes > 50 GB → prune `rmab-e2e-*` stacks with no running container (never the preview), images labelled with this run's slug, our dangling images, build cache). Pool-safe: other slots' running stacks and images are never touched. Then `down -v` the project.
-- After: `down -v --remove-orphans`; `image rm` images this run built or pulled (+ `--image` with `--rm-image`); `image prune -f --filter label=rmab-e2e=true`; `builder prune -f --keep-storage 15gb` (or `--max-used-space` on newer Docker).
-- Kept between runs: only the preview stack and its image.
+## Cleanup (every stack/unit run, in `finally`, incl. failures)
+- Before: `down -v` the project. Disk ceiling: `docker system df` images+cache+volumes > 50 GB → prune `rmab-e2e-*` stacks with no running container (never the preview), images labelled with this run's slug, our dangling images, and the build cache (cap 15 GB). Pool-safe: other slots' stacks and images are never touched.
+- After: `down -v --remove-orphans`; remove images this run built (only if labelled `rmab-e2e=true`) and images it pulled; `image prune -f --filter label=rmab-e2e=true`. No routine `builder prune`.
+- Kept between runs: the preview stack and its image, plus shared bases (Playwright ~2.5 GB, Audiobookshelf ~0.36 GB).
 
 ## Critical Issues
-- Unit tests must not reach the network: `e2e:unit` runs `--network none`, so an unmocked call (e.g. Audnexus via `getAudibleService`) hangs to the 20 s timeout even though host `npm test` passes.
-- `setup/complete` with `authMethod: manual` 500s without a `registration` object (after writing part of the config); bootstrap always sends `registration: { require_admin_approval: true }`.
-- A daemon with broken ghcr.io credentials fails even public pulls (`denied: denied`). `--upgrade-from` then falls back to `e2e/lib/fetch-image.mjs`: anonymous registry API, every blob sha256-verified, OCI layout → `docker load`.
-- Evidence screenshots: explicit 1280x720 JPEGs (`snap()` in `lib/harness.ts`); Playwright's own screenshots are off, traces on.
-- `npx playwright install` garbage-collects other Playwright browser builds it considers unused in `%LOCALAPPDATA%\ms-playwright`; set `PLAYWRIGHT_BROWSERS_PATH` to isolate if other projects share the cache.
-- Fixture generation needs Audnexus reachable at fake-arr build time unless `--offline-fixtures`.
+- Unit tests must not reach the network: `e2e:unit` runs `--network none`, so an unmocked call hangs to the 20 s timeout even though host `npm test` passes.
+- `setup/complete` with `authMethod: manual` 500s without a `registration` object (after writing part of the config); bootstrap always sends one.
+- A daemon with broken ghcr.io credentials fails even public pulls (`denied: denied`). `--upgrade-from` falls back to `e2e/lib/fetch-image.mjs`: anonymous registry API, every descriptor validated (`sha256:` + 64 hex, safe-integer size) before use, blobs checked for digest and size, OCI layout + `manifest.json` → `docker load`.
 
 ## Related
 - [../testing.md](../testing.md) (unit suite), [../deployment/docker.md](../deployment/docker.md), [../phase3/README.md](../phase3/README.md), [../phase3/qbittorrent.md](../phase3/qbittorrent.md), [../phase3/sabnzbd.md](../phase3/sabnzbd.md), [../backend/services/jobs.md](../backend/services/jobs.md)

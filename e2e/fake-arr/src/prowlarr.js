@@ -10,6 +10,8 @@
 import { sendJson, sendText, sendBuffer, notFound } from './http-util.js';
 
 const AUDIOBOOK_CATEGORY = { id: 3030, name: 'Audio/Audiobook' };
+const CATEGORY_NAMES = { 3030: 'Audio/Audiobook', 7020: 'Books/EBook', 7000: 'Books', 3000: 'Audio' };
+const SEARCH_TYPES = new Set(['search', 'book', 'music', 'tvsearch', 'movie']);
 
 export function encodeLink(releaseId) {
   return Buffer.from(JSON.stringify({ r: releaseId })).toString('base64url');
@@ -48,7 +50,7 @@ function toProwlarrResult(state, release) {
     publishDate: release.publishDate || '2026-09-01T00:00:00Z',
     protocol: release.protocol,
     infoUrl: `http://${publicHost}:${ports.prowlarr}/info/${release.id}`,
-    categories: [AUDIOBOOK_CATEGORY],
+    categories: release.categories.map((id) => ({ id, name: CATEGORY_NAMES[id] || `Category ${id}` })),
     downloadVolumeFactor: 1,
     uploadVolumeFactor: 1,
     indexerFlags: release.indexerFlags || [],
@@ -202,11 +204,18 @@ export function handleProwlarr(state, req, res, url) {
       const status = nextStatus(scenario.search?.statuses, scenario.searchCalls - 1);
       if (status !== 200) return sendJson(res, status, { error: `scenario status ${status}` });
       const query = url.searchParams.get('query');
+      const type = url.searchParams.get('type') || 'search';
+      if (!SEARCH_TYPES.has(type)) return sendJson(res, 400, { error: `unsupported search type ${type}` });
       const indexerIds = url.searchParams.getAll('indexerIds').map(Number);
-      const results = [...state.releases.values()]
+      const categories = url.searchParams.getAll('categories').map(Number).filter(Number.isFinite);
+      const limit = Number(url.searchParams.get('limit'));
+      let results = [...state.releases.values()]
         .filter((r) => indexerIds.length === 0 || indexerIds.includes(r.indexerId))
+        .filter((r) => categories.length === 0 || r.categories.some((c) => categories.includes(c)))
         .filter((r) => matchesQuery(r, query))
         .map((r) => toProwlarrResult(state, r));
+      // Scenarios can set search.ignoreLimit to model indexers that over-return.
+      if (limit > 0 && !scenario.search?.ignoreLimit) results = results.slice(0, limit);
       return sendJson(res, 200, results);
     }
     case '/api/v1/indexer':

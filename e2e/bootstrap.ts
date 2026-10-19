@@ -119,4 +119,6 @@ export default async function globalSetup() {
       ...(user ? [{ name: 'user', value: JSON.stringify(user) }] : []),
     ] }] })
   );
+  // run.mjs maps "Playwright failed without this marker" to exit 2 (harness/bootstrap error, not a spec failure).
+  writeEvidence('bootstrap-ok', new Date().toISOString());
 }

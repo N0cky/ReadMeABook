@@ -31,6 +31,7 @@ function addJob(state, release, cat, name) {
   const nzoId = `SABnzbd_nzo_${randomBytes(6).toString('hex')}`;
   const savePath = categoryDir(state, cat);
   const job = release ? startDownload(state, release, { savePath, name }) : null;
+  if (job && state.sabPaused) pauseJob(job);
   state.nzbs.set(nzoId, { nzoId, name, cat, releaseId: release?.id, job, completedAt: 0, archived: false });
   return nzoId;
 }
@@ -114,8 +115,19 @@ export async function handleSab(state, req, res, url, recordEntry) {
         }
         return sendJson(res, 200, { status: true, nzo_ids: String(params.value || '').split(',') });
       }
+      // Per-job pause/resume (real SABnzbd: mode=queue&name=pause|resume&value=<nzo_id>).
+      if (params.name === 'pause' || params.name === 'resume') {
+        for (const id of String(params.value || '').split(',')) {
+          const n = state.nzbs.get(id);
+          if (!n?.job) continue;
+          n.userPaused = params.name === 'pause';
+          if (n.userPaused) pauseJob(n.job);
+          else if (!state.sabPaused) resumeJob(n.job);
+        }
+        return sendJson(res, 200, { status: true, nzo_ids: String(params.value || '').split(',') });
+      }
       const { queue } = sabSlots(state);
-      return sendJson(res, 200, { queue: { status: 'Downloading', paused: false, slots: queue, noofslots: queue.length } });
+      return sendJson(res, 200, { queue: { status: state.sabPaused ? 'Paused' : 'Downloading', paused: state.sabPaused, slots: queue, noofslots: queue.length } });
     }
     case 'history': {
       if (params.name === 'delete') {
@@ -130,8 +142,13 @@ export async function handleSab(state, req, res, url, recordEntry) {
     }
     case 'pause':
     case 'resume': {
-      const n = state.nzbs.get(params.value);
-      if (n?.job) (params.mode === 'pause' ? pauseJob : resumeJob)(n.job);
+      // Real SABnzbd: mode=pause / mode=resume pause or resume the WHOLE queue; `value` is ignored.
+      state.sabPaused = params.mode === 'pause';
+      for (const n of state.nzbs.values()) {
+        if (!n.job) continue;
+        if (state.sabPaused) pauseJob(n.job);
+        else if (!n.userPaused) resumeJob(n.job);
+      }
       return sendJson(res, 200, { status: true });
     }
     default:

@@ -83,6 +83,7 @@ function addTorrentRecord(state, { hash, release, name, category, tags, savePath
     addedOn: Math.floor(Date.now() / 1000),
     completionOn: 0,
     releaseId: release?.id,
+    files: release?.files || [], // kept on the record: the release may leave with a scenario switch
     job: release ? startDownload(state, release, { savePath, name }) : null,
   };
   if (record.job && paused) pauseJob(record.job);
@@ -141,12 +142,11 @@ export async function handleQbit(state, req, res, url, recordEntry) {
     case '/torrents/files': {
       const t = state.torrents.get(String(params.hash || '').toLowerCase());
       if (!t) return sendText(res, 404, 'Not Found');
-      const release = state.releases.get(t.releaseId);
       const snap = t.job ? snapshot(state, t.job) : { progress: 0 };
       return sendJson(
         res,
         200,
-        (release?.files || []).map((f, index) => ({
+        t.files.map((f, index) => ({
           index,
           name: [t.name, ...f.path].join('/'),
           size: f.length,

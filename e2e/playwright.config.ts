@@ -35,6 +35,8 @@ export default defineConfig({
     // Evidence screenshots are explicit JPEGs (lib/harness.ts snap); traces carry the rest.
     screenshot: 'off',
     video: 'off',
+    // Chromium's own sandbox (needs the Playwright seccomp profile); off = the runner container is the boundary.
+    launchOptions: { chromiumSandbox: process.env.E2E_CHROMIUM_SANDBOX === '1' },
     actionTimeout: 20_000,
     navigationTimeout: 60_000,
   },

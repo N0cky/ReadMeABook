@@ -5,7 +5,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 
 export function env(name: string): string {
   const value = process.env[name];
@@ -134,23 +133,26 @@ export interface Recorded {
   added?: { hash?: string; nzoId?: string; releaseId: string | null }[];
 }
 
-/** fake-arr control API client. */
+const ctl = (p: string, init: RequestInit = {}) =>
+  fetch(`${urls.control()}/__control${p}`, { ...init, headers: { 'x-control-token': env('E2E_CONTROL_TOKEN'), ...(init.headers || {}) } });
+
+/** fake-arr control API client (token-protected; RMAB never has the token). */
 export const fakeArr = {
   async scenario(name: string) {
-    const res = await fetch(`${urls.control()}/__control/scenario`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+    const res = await ctl('/scenario', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
     return json<{ ok: boolean; releases: string[] }>(res, `load scenario ${name}`);
   },
   async books(): Promise<Record<string, Book>> {
-    return json(await fetch(`${urls.control()}/__control/books`), 'books');
+    return json(await ctl('/books'), 'books');
   },
   async requests(since = 0): Promise<Recorded[]> {
-    return json(await fetch(`${urls.control()}/__control/requests?since=${since}`), 'recorded requests');
+    return json(await ctl(`/requests?since=${since}`), 'recorded requests');
   },
   async plexLibrary(): Promise<{ refreshes: number; albums: { ratingKey: string; title: string; parentTitle: string; guid: string; dir: string }[] }> {
-    return json(await fetch(`${urls.control()}/__control/plex-library`), 'fake Plex library');
+    return json(await ctl('/plex-library'), 'fake Plex library');
   },
   async state(): Promise<any> {
-    return json(await fetch(`${urls.control()}/__control/state`), 'fake-arr state');
+    return json(await ctl('/state'), 'fake-arr state');
   },
 };
 
@@ -189,32 +191,4 @@ export class Abs {
   async libraryItems(libraryId: string): Promise<any[]> {
     return (await this.req<{ results: any[] }>('GET', `/api/libraries/${libraryId}/items?limit=100`)).results;
   }
-}
-
-/** Run a command inside a stack service (docker compose exec -T). */
-export function stackExec(service: string, cmd: string[], input?: string): string {
-  const composeEnv = JSON.parse(env('E2E_COMPOSE_ENV'));
-  const e2eDir = path.resolve(__dirname, '..');
-  return execFileSync(
-    'docker',
-    ['compose', '-p', env('E2E_PROJECT'), '-f', path.join(e2eDir, 'compose.yml'), '--env-file', path.join(e2eDir, '.env.test'), 'exec', '-T', service, ...cmd],
-    { encoding: 'utf8', env: { ...process.env, ...composeEnv }, input }
-  );
-}
-
-/** Exact row count of every table in RMAB's public schema (via the bundled Postgres). */
-export function tableRowCounts(): Record<string, number> {
-  const sql =
-    "select table_name || '=' || (xpath('/row/c/text()', query_to_xml(format('select count(*) as c from public.%I', table_name), false, true, '')))[1]::text " +
-    "from information_schema.tables where table_schema = 'public' and table_type = 'BASE TABLE' order by 1";
-  const out = stackExec('rmab', ['gosu', 'postgres', 'psql', '-d', 'readmeabook', '-At', '-c', sql]);
-  return Object.fromEntries(
-    out
-      .split(/\r?\n/)
-      .filter((l) => l.includes('='))
-      .map((l) => {
-        const [k, v] = l.split('=');
-        return [k, Number(v)];
-      })
-  );
 }

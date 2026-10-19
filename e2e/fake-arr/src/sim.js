@@ -51,7 +51,8 @@ export function snapshot(state, job, now = Date.now()) {
     fraction = job.stallAtPct / 100;
     phase = 'stalled';
   }
-  if (fraction >= 1 && !job.paused) {
+  // Finished stays finished: a completed job that is later paused reports 100% (qBit pausedUP).
+  if (fraction >= 1) {
     if (!job.materialized) materialize(state, job);
     phase = 'complete';
   }

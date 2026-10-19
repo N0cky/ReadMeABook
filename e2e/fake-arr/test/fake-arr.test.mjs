@@ -22,10 +22,14 @@ let tmp;
 let fa;
 let cfg;
 const KEY = 'test-canary-key';
+const TOKEN = 'test-control-token-0123456789';
 
 const base = (svc) => `http://127.0.0.1:${cfg.ports[svc]}`;
 const control = (p, body) =>
-  fetch(`${base('control')}/__control${p}`, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}).then((r) => r.json());
+  fetch(`${base('control')}/__control${p}`, {
+    headers: { 'x-control-token': TOKEN, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+    ...(body ? { method: 'POST', body: JSON.stringify(body) } : {}),
+  }).then((r) => r.json());
 const posix = (p) => p.split(path.sep).join('/');
 
 async function loadDef(def) {
@@ -83,6 +87,7 @@ before(async () => {
     TRACKER_HOST: 'localhost',
     PROWLARR_PORT: '0', TRACKER_PORT: '0', QBIT_PORT: '0', SAB_PORT: '0', PLEX_PORT: '0', CONTROL_PORT: '0',
     SCENARIO: 'smoke',
+    CONTROL_TOKEN: TOKEN,
   });
   fa = await startFakeArr(cfg);
 });
@@ -181,7 +186,7 @@ test('redirect knobs: other-port, tracker, relative, magnet at hop 2, direct; re
 
   // Following a chain with fetch() forwards custom headers across origins: the recorder must show it.
   await fetch(t('tracker').downloadUrl, { headers: { 'X-Api-Key': KEY } });
-  const records = await fetch(`${base('control')}/__control/requests`).then((r) => r.json());
+  const records = await control('/requests');
   const trackerHits = records.filter((r) => r.listener === cfg.ports.tracker && r.path.startsWith('/t/t-tracker/'));
   assert.ok(trackerHits.length >= 1);
   assert.equal(trackerHits.at(-1).headers['x-api-key'], KEY);
@@ -296,9 +301,103 @@ test('plex: identity, sections, library listing from the media volume, refresh c
   assert.equal(all.MediaContainer.Metadata[0].title, 'Fixture Book One');
   assert.equal(all.MediaContainer.Metadata[0].parentTitle, 'Test Author');
   fs.mkdirSync(path.join(tmp, 'media', 'audiobooks', 'Test Author', 'Fixture Book Two B082BHJMFF'), { recursive: true });
-  const lib = await fetch(`${base('control')}/__control/plex-library`).then((r) => r.json());
+  const lib = await control('/plex-library');
   const two = lib.albums.find((a) => a.title === 'Fixture Book Two');
   assert.equal(two.guid, 'com.plexapp.agents.audible://B082BHJMFF?lang=en');
   await fetch(`${base('plex')}/library/sections/1/refresh`, { headers: hdr });
   assert.equal((await control('/state')).plexRefreshes, 1);
+});
+
+test('control API: token required (except /health); wrong token rejected', async () => {
+  assert.equal((await fetch(`${base('control')}/__control/health`)).status, 200);
+  assert.equal((await fetch(`${base('control')}/__control/requests`)).status, 401);
+  assert.equal((await fetch(`${base('control')}/__control/state`, { headers: { 'x-control-token': 'wrong-token-but-long-enough' } })).status, 401);
+  assert.equal((await fetch(`${base('control')}/__control/scenario`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"name":"smoke"}' })).status, 401);
+});
+
+test('releases sharing a fixture get distinct info-hashes and NZBs', async () => {
+  await loadDef({
+    name: 'unit-shared',
+    book: 'phm',
+    indexers: [{ id: 1, name: 'T', protocol: 'torrent' }, { id: 2, name: 'U', protocol: 'usenet' }],
+    releases: [
+      { id: 't1', title: '{{title}} one', fixture: 'phm-mp3' },
+      { id: 't2', title: '{{title}} two', fixture: 'phm-mp3' },
+      { id: 'n1', protocol: 'usenet', indexerId: 2, title: '{{title}} nzb one', fixture: 'phm-mp3' },
+      { id: 'n2', protocol: 'usenet', indexerId: 2, title: '{{title}} nzb two', fixture: 'phm-mp3' },
+    ],
+  });
+  const st = await control('/state');
+  const hashes = st.releases.filter((r) => r.protocol === 'torrent').map((r) => r.infoHash);
+  assert.equal(new Set(hashes).size, 2);
+  const results = await search('Fixture Book One');
+  const nzbs = await Promise.all(results.filter((r) => r.protocol === 'usenet').map(async (r) => Buffer.from(await (await fetch(r.downloadUrl)).arrayBuffer()).toString()));
+  assert.equal(nzbs.length, 2);
+  assert.notEqual(nzbs[0], nzbs[1]);
+});
+
+test('scenario switch keeps the recorder, qBit sessions/categories and in-flight torrents', async () => {
+  await control('/reset');
+  const cookie = await qbitLogin();
+  await fetch(`${base('qbit')}/api/v2/torrents/createCategory`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ category: 'keep', savePath: '/x' }) });
+  const before = (await control('/requests')).length;
+  assert.ok(before >= 2);
+  await control('/scenario', { name: 'smoke' });
+  assert.ok((await control('/requests')).length >= before);
+  const cats = await fetch(`${base('qbit')}/api/v2/torrents/categories`, { headers: { Cookie: cookie } });
+  assert.equal(cats.status, 200, 'session survived the scenario switch');
+  assert.ok((await cats.json()).keep);
+});
+
+test('qbit: a finished torrent that is paused reports pausedUP at 100%', async () => {
+  await loadDef({ name: 'unit-pause', book: 'phm', releases: [{ id: 'p', title: '{{title}} pause', fixture: 'phm-mp3', download: { completeMs: 100 } }] });
+  const cookie = await qbitLogin();
+  const [rel] = await search('Fixture Book One');
+  const form = (o) => ({ method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(o) });
+  await fetch(`${base('qbit')}/api/v2/torrents/add`, form({ urls: rel.magnetUrl || `magnet:?xt=urn:btih:${rel.infoHash}` }));
+  const info = async () => (await fetch(`${base('qbit')}/api/v2/torrents/info?hashes=${rel.infoHash}`, { headers: { Cookie: cookie } }).then((r) => r.json()))[0];
+  await waitFor(async () => (await info()).state === 'uploading');
+  await fetch(`${base('qbit')}/api/v2/torrents/pause`, form({ hashes: rel.infoHash }));
+  const paused = await info();
+  assert.equal(paused.state, 'pausedUP');
+  assert.equal(paused.progress, 1);
+});
+
+test('sab: mode=pause is a global queue pause; queue&name=pause pauses one job', async () => {
+  await loadDef({ name: 'unit-sabpause', book: 'phm', indexers: [{ id: 2, name: 'U', protocol: 'usenet' }], releases: [
+    { id: 'a', protocol: 'usenet', indexerId: 2, title: '{{title}} a', fixture: 'phm-mp3', download: { completeMs: 60000 } },
+    { id: 'b', protocol: 'usenet', indexerId: 2, title: '{{title}} b', fixture: 'phm-mp3', download: { completeMs: 60000 } },
+  ] });
+  const api = (q) => fetch(`${base('sab')}/api?${new URLSearchParams({ output: 'json', apikey: 'sabkey', ...q })}`).then((r) => r.json());
+  const ids = [];
+  for (const rel of await search('Fixture Book One')) {
+    const fd = new FormData();
+    fd.append('nzbfile', new Blob([Buffer.from(await (await fetch(rel.downloadUrl)).arrayBuffer())]), 'x.nzb');
+    for (const [k, v] of Object.entries({ mode: 'addfile', cat: 'readmeabook', output: 'json', apikey: 'sabkey' })) fd.append(k, v);
+    ids.push((await fetch(`${base('sab')}/api`, { method: 'POST', body: fd }).then((r) => r.json())).nzo_ids[0]);
+  }
+  await api({ mode: 'queue', name: 'pause', value: ids[0] });
+  let q = (await api({ mode: 'queue' })).queue;
+  assert.equal(q.paused, false);
+  assert.deepEqual(q.slots.map((s) => s.status).sort(), ['Downloading', 'Paused']);
+  await api({ mode: 'pause', value: ids[1] }); // value ignored: whole queue
+  q = (await api({ mode: 'queue' })).queue;
+  assert.equal(q.paused, true);
+  assert.deepEqual(q.slots.map((s) => s.status), ['Paused', 'Paused']);
+  await api({ mode: 'resume' });
+  q = (await api({ mode: 'queue' })).queue;
+  assert.deepEqual(q.slots.map((s) => s.status).sort(), ['Downloading', 'Paused'], 'per-job pause survives a global resume');
+});
+
+test('prowlarr search honours categories, limit and type', async () => {
+  await loadDef({ name: 'unit-filters', book: 'phm', releases: [
+    { id: 'a1', title: '{{title}} a1', fixture: 'phm-mp3' },
+    { id: 'a2', title: '{{title}} a2', fixture: 'phm-mp3' },
+    { id: 'e1', title: '{{title}} e1', fixture: 'phm-mp3', categories: [7020] },
+  ] });
+  const q = (extra) => fetch(`${base('prowlarr')}/api/v1/search?query=Fixture&${extra}`, { headers: { 'X-Api-Key': KEY } });
+  assert.equal((await (await q('type=search&categories=3030')).json()).length, 2);
+  assert.equal((await (await q('type=search&categories=7020')).json()).length, 1);
+  assert.equal((await (await q('type=search&categories=3030&categories=7020&limit=2')).json()).length, 2);
+  assert.equal((await q('type=nonsense')).status, 400);
 });

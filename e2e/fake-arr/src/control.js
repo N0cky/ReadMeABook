@@ -3,15 +3,25 @@
  * Documentation: documentation/testing/e2e-harness.md
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { readParams, sendJson, notFound } from './http-util.js';
 import { torrentInfo } from './qbit.js';
 import { sabSlots } from './sab.js';
 import { scanAlbums } from './plex.js';
 
+/** Constant-time token check; the token is per run and only the harness runner and host hold it. */
+function authorized(state, req) {
+  const want = Buffer.from(state.config.controlToken || '');
+  const got = Buffer.from(String(req.headers['x-control-token'] || ''));
+  return want.length >= 16 && got.length === want.length && timingSafeEqual(want, got);
+}
+
 export async function handleControl(state, req, res, url) {
   const p = url.pathname.replace(/^\/__control/, '') || '/';
   try {
-    if (p === '/health' && req.method === 'GET') return sendJson(res, 200, { ok: true, scenario: state.scenario?.name ?? null });
+    // Health stays open (container healthcheck); it reveals nothing.
+    if (p === '/health' && req.method === 'GET') return sendJson(res, 200, { ok: true });
+    if (!authorized(state, req)) return sendJson(res, 401, { ok: false, error: 'control token required' });
     if (p === '/scenarios' && req.method === 'GET') return sendJson(res, 200, state.listScenarios());
     if (p === '/books' && req.method === 'GET') return sendJson(res, 200, state.fixtureIndex.books);
     if (p === '/plex-library' && req.method === 'GET') {

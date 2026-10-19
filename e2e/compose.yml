@@ -2,11 +2,17 @@
 # Documentation: documentation/testing/e2e-harness.md
 #
 # Always driven by e2e/run.mjs from a trusted checkout:
-#   docker compose -p rmab-e2e-<slug> -f e2e/compose.yml --env-file e2e/.env.test ...
-# Rules: named volumes only (no host bind mounts), every published port bound to 127.0.0.1,
-# RMAB on the assigned RMAB_PORT, everything else on ephemeral ports read back with `docker compose port`.
+#   docker compose -p rmab-e2e-<slug> -f e2e/compose.yml [-f e2e/compose.tainted.yml] --env-file e2e/.env.test ...
+# Rules: named volumes only (no host bind mounts). Only RMAB is published (127.0.0.1:RMAB_PORT, trusted
+# runs only). The Playwright runner container joins `stack` + `control`; RMAB is never on `control`.
 
 name: rmab-e2e-${E2E_SLUG:?E2E_SLUG is required}
+
+networks:
+  stack: {}
+  # fake-arr's control listener is reachable only from here AND requires CONTROL_TOKEN.
+  control:
+    internal: true
 
 services:
   rmab:
@@ -15,8 +21,8 @@ services:
       fake-arr:
         condition: service_healthy
       abs:
-    # Same index digest as ghcr.io/advplyr/audiobookshelf:2.37.1; Docker Hub avoids ghcr.io daemon-auth issues.
         condition: service_started
+    networks: [stack]
     ports:
       - "127.0.0.1:${RMAB_PORT:?RMAB_PORT is required}:3030"
     environment:
@@ -28,7 +34,8 @@ services:
       JWT_REFRESH_SECRET: ${RMAB_JWT_REFRESH_SECRET:-}
       CONFIG_ENCRYPTION_KEY: ${RMAB_CONFIG_ENCRYPTION_KEY:-}
       POSTGRES_PASSWORD: ${RMAB_POSTGRES_PASSWORD:-}
-      PUBLIC_URL: http://127.0.0.1:${RMAB_PORT}
+      # The browser (runner container) reaches RMAB as http://rmab:3030.
+      PUBLIC_URL: http://rmab:3030
     volumes:
       - rmab-config:/app/config
       - rmab-cache:/app/cache
@@ -42,8 +49,7 @@ services:
   abs:
     # Same index digest as ghcr.io/advplyr/audiobookshelf:2.37.1; Docker Hub avoids ghcr.io daemon-auth issues.
     image: ${ABS_IMAGE:-docker.io/advplyr/audiobookshelf:2.37.1@sha256:581d68b2a6fc7ebf58d81c878a9f387cbbc0d88ac9d37b298b9cee10168af85b}
-    ports:
-      - "127.0.0.1::80"
+    networks: [stack]
     volumes:
       - abs-config:/config
       - abs-metadata:/metadata
@@ -60,12 +66,12 @@ services:
         FIXTURE_METADATA: ${FIXTURE_METADATA:-}
       labels:
         rmab-e2e: "true"
+        rmab-e2e.slug: ${E2E_SLUG}
     networks:
-      default:
+      stack:
         aliases:
           - tracker.e2e
-    ports:
-      - "127.0.0.1::9999"
+      control: {}
     environment:
       PUID: ${PUID}
       PGID: ${PGID}
@@ -75,6 +81,7 @@ services:
       QBIT_PASS: ${QBIT_PASS}
       SAB_API_KEY: ${SAB_API_KEY}
       PLEX_TOKEN: ${PLEX_TOKEN}
+      CONTROL_TOKEN: ${CONTROL_TOKEN:?CONTROL_TOKEN is required}
       PUBLIC_HOST: fake-arr
       TRACKER_HOST: tracker.e2e
     volumes:

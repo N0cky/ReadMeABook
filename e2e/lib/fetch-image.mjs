@@ -66,46 +66,74 @@ async function token(registry, repo) {
   return (await res.json()).token;
 }
 
+const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+const MAX_BLOB_BYTES = 8 * 1024 ** 3;
+
+/**
+ * Validate a registry descriptor BEFORE it is fetched or used in a path: the digest must be a plain
+ * sha256 digest and the size a non-negative safe integer under the cap. Throws on anything else.
+ */
+export function validateDescriptor(desc, what = 'descriptor') {
+  if (!desc || typeof desc !== 'object') throw new Error(`${what}: not an object`);
+  if (typeof desc.digest !== 'string' || !DIGEST_RE.test(desc.digest)) throw new Error(`${what}: invalid digest ${JSON.stringify(desc.digest)}`);
+  if (!Number.isSafeInteger(desc.size) || desc.size < 0 || desc.size > MAX_BLOB_BYTES) throw new Error(`${what}: invalid size ${JSON.stringify(desc.size)}`);
+  return desc;
+}
+
+/** Local blob path for a validated digest (never derived from unvalidated input). */
+export function blobPath(blobsDir, digest) {
+  if (!DIGEST_RE.test(digest)) throw new Error(`invalid digest ${JSON.stringify(digest)}`);
+  return path.join(blobsDir, digest.slice('sha256:'.length));
+}
+
+/**
+ * GET a manifest (accept set) or blob. `ref` is either a validated descriptor {digest,size} or, for the
+ * first manifest only, a tag. Content is checked against the descriptor's digest and size.
+ */
 async function getBlob(base, auth, ref, accept, dest) {
-  const res = await fetch(`${base}/${accept ? 'manifests' : 'blobs'}/${ref}`, {
+  const desc = typeof ref === 'string' ? null : validateDescriptor(ref);
+  if (!desc && !TAG_RE.test(ref) && !DIGEST_RE.test(ref)) throw new Error(`invalid tag/digest ${JSON.stringify(ref)}`);
+  const id = desc ? desc.digest : ref;
+  const res = await fetch(`${base}/${accept ? 'manifests' : 'blobs'}/${id}`, {
     headers: { Authorization: `Bearer ${auth}`, ...(accept ? { Accept: accept.join(',') } : {}) },
   });
-  if (!res.ok) throw new Error(`GET ${ref}: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`GET ${id}: HTTP ${res.status}`);
   const buf = Buffer.from(await res.arrayBuffer());
   const actual = `sha256:${createHash('sha256').update(buf).digest('hex')}`;
-  if (ref.startsWith('sha256:') && actual !== ref) throw new Error(`digest mismatch for ${ref}: got ${actual}`);
+  if (DIGEST_RE.test(id) && actual !== id) throw new Error(`digest mismatch for ${id}: got ${actual}`);
+  if (desc && buf.length !== desc.size) throw new Error(`size mismatch for ${id}: expected ${desc.size}, got ${buf.length}`);
   if (dest) fs.writeFileSync(dest, buf);
   return { buf, type: res.headers.get('content-type') || '', digest: actual };
 }
 
-/** Fetch `ref` (linux/amd64) and `docker load` it, tagged as `<registry>/<repo>:<tag>`. Returns that tag. */
-export async function fetchAndLoad(ref, { platform = { os: 'linux', architecture: 'amd64' }, log = console.log } = {}) {
-  const { registry, repo, tag, digest } = parseRef(ref);
-  const base = `https://${registry}/v2/${repo}`;
-  const auth = await token(registry, repo);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rmab-e2e-oci-'));
+/**
+ * Fetch `<base>/manifests/<tagOrDigest>` (+ the platform manifest and every blob) into an OCI layout in
+ * `dir`, validating every descriptor first. Exported for tests (a local fake registry as `base`).
+ */
+export async function fetchToLayout({ base, auth, tag, digest, name, dir, platform = { os: 'linux', architecture: 'amd64' }, log = () => {} }) {
   const blobs = path.join(dir, 'blobs', 'sha256');
   fs.mkdirSync(blobs, { recursive: true });
-  const tar = path.join(os.tmpdir(), `rmab-e2e-oci-${Date.now()}.tar`);
-  try {
+  {
     let top = await getBlob(base, auth, digest || tag, [...INDEX_TYPES, ...MANIFEST_TYPES]);
     let desc;
     if (INDEX_TYPES.some((t) => top.type.startsWith(t))) {
       const index = JSON.parse(top.buf.toString('utf8'));
-      desc = index.manifests.find((m) => m.platform?.os === platform.os && m.platform?.architecture === platform.architecture);
-      if (!desc) throw new Error(`no ${platform.os}/${platform.architecture} manifest in ${ref}`);
-      top = await getBlob(base, auth, desc.digest, MANIFEST_TYPES, path.join(blobs, desc.digest.slice(7)));
+      desc = (index.manifests || []).find((m) => m?.platform?.os === platform.os && m?.platform?.architecture === platform.architecture);
+      if (!desc) throw new Error(`no ${platform.os}/${platform.architecture} manifest in ${name}`);
+      validateDescriptor(desc, 'platform manifest');
+      top = await getBlob(base, auth, desc, MANIFEST_TYPES, blobPath(blobs, desc.digest));
     } else {
-      fs.writeFileSync(path.join(blobs, top.digest.slice(7)), top.buf);
+      fs.writeFileSync(blobPath(blobs, top.digest), top.buf);
       desc = { mediaType: top.type, digest: top.digest, size: top.buf.length };
     }
     const manifest = JSON.parse(top.buf.toString('utf8'));
-    const all = [manifest.config, ...manifest.layers];
+    if (!Array.isArray(manifest.layers)) throw new Error('manifest has no layers[]');
+    const all = [manifest.config, ...manifest.layers].map((d, i) => validateDescriptor(d, i === 0 ? 'config' : `layer ${i}`));
     for (const [i, blob] of all.entries()) {
-      log(`[e2e] fetch ${registry}/${repo}: blob ${i + 1}/${all.length} (${(blob.size / 1e6).toFixed(1)} MB)`);
-      await getBlob(base, auth, blob.digest, null, path.join(blobs, blob.digest.slice(7)));
+      log(`[e2e] fetch ${name}: blob ${i + 1}/${all.length} (${(blob.size / 1e6).toFixed(1)} MB)`);
+      await getBlob(base, auth, blob, null, blobPath(blobs, blob.digest));
     }
-    const name = `${registry}/${repo}:${tag}`;
     fs.writeFileSync(path.join(dir, 'oci-layout'), JSON.stringify({ imageLayoutVersion: '1.0.0' }));
     fs.writeFileSync(
       path.join(dir, 'index.json'),
@@ -118,8 +146,23 @@ export async function fetchAndLoad(ref, { platform = { os: 'linux', architecture
     // image store only reads manifest.json; layers may stay compressed.
     fs.writeFileSync(
       path.join(dir, 'manifest.json'),
-      JSON.stringify([{ Config: `blobs/sha256/${manifest.config.digest.slice(7)}`, RepoTags: [name], Layers: manifest.layers.map((l) => `blobs/sha256/${l.digest.slice(7)}`) }])
+      JSON.stringify([{ Config: `blobs/sha256/${all[0].digest.slice(7)}`, RepoTags: [name], Layers: all.slice(1).map((l) => `blobs/sha256/${l.digest.slice(7)}`) }])
     );
+    return { blobs };
+  }
+}
+
+/** Fetch `ref` (linux/amd64) and `docker load` it, tagged as `<registry>/<repo>:<tag>`. Returns that tag. */
+export async function fetchAndLoad(ref, { platform = { os: 'linux', architecture: 'amd64' }, log = console.log } = {}) {
+  const { registry, repo, tag, digest } = parseRef(ref);
+  if (!TAG_RE.test(tag)) throw new Error(`invalid tag ${JSON.stringify(tag)}`);
+  const base = `https://${registry}/v2/${repo}`;
+  const auth = await token(registry, repo);
+  const name = `${registry}/${repo}:${tag}`;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rmab-e2e-oci-'));
+  const tar = path.join(os.tmpdir(), `rmab-e2e-oci-${Date.now()}.tar`);
+  try {
+    const { blobs } = await fetchToLayout({ base, auth, tag, digest, name, dir, platform, log });
     writeTar(dir, ['oci-layout', 'index.json', 'manifest.json', ...fs.readdirSync(blobs).map((b) => path.join('blobs', 'sha256', b))], tar);
     const load = spawnSync('docker', ['load', '-i', tar], { encoding: 'utf8' });
     if (load.status !== 0) throw new Error(`docker load failed: ${load.stderr}`);

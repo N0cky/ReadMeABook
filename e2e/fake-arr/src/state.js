@@ -31,6 +31,8 @@ export function loadConfig(env = process.env) {
       control: Number(env.CONTROL_PORT || 9999),
     },
     defaultScenario: env.SCENARIO || 'smoke',
+    // Required for every /__control call except /health. run.mjs generates one per run; RMAB never gets it.
+    controlToken: env.CONTROL_TOKEN || '',
   };
 }
 
@@ -43,18 +45,28 @@ export class State {
     this.reset();
   }
 
+  /** Full reset (POST /__control/reset): recorder, sessions, categories, downloads and scenario. */
   reset() {
     this.seq = 0;
     this.records = [];
-    this.scenario = null;
-    this.releases = new Map(); // id -> release (with derived torrent/nzb data)
-    this.byHash = new Map(); // infoHash -> release id
     this.torrents = new Map(); // hash -> qbit torrent record
     this.nzbs = new Map(); // nzo_id -> sab job record
     this.qbitCategories = {};
     this.qbitSessions = new Set();
     this.sabCategories = {};
+    this.sabPaused = false;
     this.plexRefreshes = 0;
+    this.resetScenario();
+  }
+
+  /**
+   * Scenario-only reset. The recorder, client sessions/categories and in-flight downloads survive a
+   * scenario switch, so key-leak checks still see bootstrap/setup traffic and RMAB's sessions stay valid.
+   */
+  resetScenario() {
+    this.scenario = null;
+    this.releases = new Map(); // id -> release (with derived torrent/nzb data)
+    this.byHash = new Map(); // infoHash -> release id
   }
 
   /** Record one inbound request (all headers kept verbatim: the key-leak checks need them). */
@@ -80,10 +92,10 @@ export class State {
     return this.loadScenario(readJson(file));
   }
 
-  /** Replace all state with a scenario definition. */
+  /** Replace the scenario (releases, indexers, knobs). Other state is kept; see resetScenario(). */
   loadScenario(def) {
     if (!def || !Array.isArray(def.releases)) throw new Error('scenario must define releases[]');
-    this.reset();
+    this.resetScenario();
     this.scenario = { indexers: [{ id: 1, name: 'E2E Torrents', protocol: 'torrent' }], search: {}, ...def };
     for (const raw of def.releases) {
       const release = this.deriveRelease(raw, def);
@@ -135,19 +147,22 @@ export class State {
       grab: { statuses: [200], redirects: [], ...(raw.grab || {}) },
       download: { completeMs: 4000, ...(raw.download || {}) },
       grabAttempts: 0,
+      categories: raw.categories || [3030],
     };
+    // Salt per scenario + release so releases sharing a fixture still get distinct hashes / NZBs.
+    const salt = `${def.name}:${raw.id}`;
     if (protocol === 'torrent') {
       if (raw.link === 'magnet') {
-        release.infoHash = magnetHash(`${def.name}:${raw.id}`);
+        release.infoHash = magnetHash(salt);
         release.magnet = buildMagnet(release.infoHash, name, tracker);
       } else {
-        const torrent = buildTorrent({ name, files, announce: tracker });
+        const torrent = buildTorrent({ name, files, announce: tracker, source: salt });
         release.infoHash = torrent.infoHash;
         release.torrentFile = torrent.buffer;
         release.magnet = buildMagnet(torrent.infoHash, name, tracker);
       }
     } else {
-      release.nzbFile = buildNzb({ name, files });
+      release.nzbFile = buildNzb({ name, files, releaseId: raw.id });
     }
     return release;
   }
@@ -157,12 +172,11 @@ export class State {
     return id ? this.releases.get(id) : undefined;
   }
 
-  /** Match an NZB upload back to its release by the <meta type="name"> we emitted. */
+  /** Match an NZB upload back to its release by the <meta type="x-fake-arr-release"> we emitted. */
   releaseForNzb(buffer) {
-    const name = /<meta type="name">([^<]*)<\/meta>/.exec(buffer.toString('utf8'))?.[1];
-    if (!name) return undefined;
-    const unescaped = name.replace(/&lt;/g, '<').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-    return [...this.releases.values()].find((r) => r.protocol === 'usenet' && r.name === unescaped);
+    const id = /<meta type="x-fake-arr-release">([A-Za-z0-9_-]+)<\/meta>/.exec(buffer.toString('utf8'))?.[1];
+    const release = id ? this.releases.get(id) : undefined;
+    return release?.protocol === 'usenet' && release.nzbFile.equals(buffer) ? release : undefined;
   }
 }
 

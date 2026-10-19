@@ -17,7 +17,7 @@
     "rmab:recover": "node scripts/recover-credentials.js",
     "e2e": "node e2e/run.mjs",
     "e2e:unit": "node e2e/run.mjs unit",
-    "e2e:selftest": "node --test e2e/fake-arr/test/fake-arr.test.mjs e2e/fixtures/test/generate.test.mjs"
+    "e2e:selftest": "node --test e2e/fake-arr/test/fake-arr.test.mjs e2e/fixtures/test/generate.test.mjs e2e/fake-arr/test/egress-proxy.test.mjs e2e/lib/test/fetch-image.test.mjs e2e/lib/test/args.test.mjs"
   },
   "dependencies": {
     "@heroicons/react": "^2.2.0",
@@ -47,7 +47,6 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@playwright/test": "1.56.1",
     "@tailwindcss/postcss": "^4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.1",
