@@ -295,6 +295,10 @@ test('plex: identity, sections, library listing from the media volume, refresh c
   const all = await fetch(`${base('plex')}/library/sections/1/all?type=9`, { headers: hdr }).then((r) => r.json());
   assert.equal(all.MediaContainer.Metadata[0].title, 'Fixture Book One');
   assert.equal(all.MediaContainer.Metadata[0].parentTitle, 'Test Author');
+  fs.mkdirSync(path.join(tmp, 'media', 'audiobooks', 'Test Author', 'Fixture Book Two B082BHJMFF'), { recursive: true });
+  const lib = await fetch(`${base('control')}/__control/plex-library`).then((r) => r.json());
+  const two = lib.albums.find((a) => a.title === 'Fixture Book Two');
+  assert.equal(two.guid, 'com.plexapp.agents.audible://B082BHJMFF?lang=en');
   await fetch(`${base('plex')}/library/sections/1/refresh`, { headers: hdr });
   assert.equal((await control('/state')).plexRefreshes, 1);
 });

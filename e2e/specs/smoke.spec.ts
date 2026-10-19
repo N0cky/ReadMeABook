@@ -11,12 +11,19 @@ const shot = (page: Page, name: string) => snap(page, 'smoke', name);
 test('smoke: a requested book is grabbed, downloaded, organized and shows up in the library', async ({ page }) => {
   await fakeArr.scenario('smoke');
   const book = (await fakeArr.books()).phm;
+  const plexMode = env('E2E_BACKEND') === 'plex';
 
   await test.step('sign in through the local admin form', async () => {
     await page.goto('/login');
+    if (plexMode) {
+      // Plex mode hides the local form behind the "Admin Login" toggle (Plex OAuth can't be automated).
+      await shot(page, '00-login-plex-mode');
+      await page.getByRole('button', { name: /Admin Login/ }).click();
+    }
     await page.locator('#admin-username').fill(env('E2E_ADMIN_USER'));
     await page.locator('#admin-password').fill(env('E2E_ADMIN_PASSWORD'));
-    await page.getByRole('button', { name: 'Login', exact: true }).click();
+    // Local form submit is "Login"; the Plex-mode admin form's is "Login as Admin".
+    await page.getByRole('button', { name: /^Login( as Admin)?$/ }).click();
     await page.waitForURL((u) => !u.pathname.startsWith('/login'), { timeout: 30_000 });
     await shot(page, '01-home');
   });
@@ -65,22 +72,29 @@ test('smoke: a requested book is grabbed, downloaded, organized and shows up in 
     await shot(page, '05-requests-downloaded');
   });
 
-  await test.step('Audiobookshelf has the book and RMAB marks it available', async () => {
-    const abs = await Abs.login();
-    const libraryId = authState().absLibraryId;
-    const item = await waitFor(
-      'ABS library item',
-      async () => {
-        await abs.req('POST', `/api/libraries/${libraryId}/scan`).catch(() => undefined);
-        const items = await abs.libraryItems(libraryId);
-        return items.find((i) => i.media?.metadata?.title === book.title) || null;
-      },
-      { timeoutMs: 180_000, intervalMs: 5_000 }
-    );
-    writeEvidence('smoke/abs-item.json', { id: item.id, path: item.path, title: item.media?.metadata?.title, numAudioFiles: item.media?.numAudioFiles });
+  await test.step(`${plexMode ? 'fake Plex' : 'Audiobookshelf'} has the book and RMAB marks it available`, async () => {
+    if (plexMode) {
+      // fake Plex lists <media>/audiobooks/<Author>/<Title> folders, so the organized book is the album.
+      const album = await waitFor('fake Plex album', async () => (await fakeArr.plexLibrary()).albums.find((a) => a.title === book.title) || null, { timeoutMs: 180_000, intervalMs: 5_000 });
+      writeEvidence('smoke/plex-album.json', album);
+    } else {
+      const abs = await Abs.login();
+      const libraryId = authState().absLibraryId;
+      const item = await waitFor(
+        'ABS library item',
+        async () => {
+          await abs.req('POST', `/api/libraries/${libraryId}/scan`).catch(() => undefined);
+          const items = await abs.libraryItems(libraryId);
+          return items.find((i) => i.media?.metadata?.title === book.title) || null;
+        },
+        { timeoutMs: 180_000, intervalMs: 5_000 }
+      );
+      writeEvidence('smoke/abs-item.json', { id: item.id, path: item.path, title: item.media?.metadata?.title, numAudioFiles: item.media?.numAudioFiles });
+    }
     const available = await waitFor(
       'request available',
       async () => {
+        if (plexMode) await rmab.triggerScheduledJob('plex_library_scan').catch(() => undefined);
         await rmab.triggerScheduledJob('plex_recently_added_check').catch(() => undefined);
         const r = await findMine();
         return r?.status === 'available' ? r : null;

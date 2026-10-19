@@ -31,12 +31,15 @@ export function scanAlbums(state) {
       const dir = path.join(authorDir, title.name);
       const stat = fs.statSync(dir);
       const ratingKey = String(parseInt(createHash('sha1').update(dir).digest('hex').slice(0, 7), 16));
+      // Folder names may end in an ASIN ("Title B0XXXXXXXX" or "Title [B0XXXXXXXX]"): like Plex's
+      // Audible agent, expose it in the guid and keep it out of the album title.
+      const asin = /(?:^|\s)\[?(B0[A-Z0-9]{8})\]?\s*$/.exec(title.name)?.[1];
       albums.push({
         ratingKey,
         key: `/library/metadata/${ratingKey}/children`,
-        guid: `plex://album/e2e${ratingKey}`,
+        guid: asin ? `com.plexapp.agents.audible://${asin}?lang=en` : `plex://album/e2e${ratingKey}`,
         type: 'album',
-        title: title.name.replace(/\s*\[[A-Z0-9]{10}\]\s*$/, ''),
+        title: title.name.replace(/\s*\[?B0[A-Z0-9]{8}\]?\s*$/, ''),
         parentTitle: author.name,
         librarySectionID: SECTION_ID,
         addedAt: Math.floor(stat.mtimeMs / 1000),

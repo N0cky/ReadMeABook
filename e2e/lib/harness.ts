@@ -146,6 +146,9 @@ export const fakeArr = {
   async requests(since = 0): Promise<Recorded[]> {
     return json(await fetch(`${urls.control()}/__control/requests?since=${since}`), 'recorded requests');
   },
+  async plexLibrary(): Promise<{ refreshes: number; albums: { ratingKey: string; title: string; parentTitle: string; guid: string; dir: string }[] }> {
+    return json(await fetch(`${urls.control()}/__control/plex-library`), 'fake Plex library');
+  },
   async state(): Promise<any> {
     return json(await fetch(`${urls.control()}/__control/state`), 'fake-arr state');
   },
