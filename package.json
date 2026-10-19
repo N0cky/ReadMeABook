@@ -19,9 +19,9 @@
   "dependencies": {
     "@heroicons/react": "^2.2.0",
     "@prisma/client": "^6.19.0",
-    "@types/archiver": "^7.0.0",
+    "@types/archiver": "^8.0.0",
     "adm-zip": "^0.5.16",
-    "archiver": "^7.0.1",
+    "archiver": "^8.0.0",
     "axios": "^1.7.2",
     "bcrypt": "^5.1.1",
     "bull": "^4.12.0",

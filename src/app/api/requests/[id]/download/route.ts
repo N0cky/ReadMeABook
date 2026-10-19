@@ -11,7 +11,7 @@ import { AUDIO_EXTENSIONS, EBOOK_EXTENSIONS } from '@/lib/constants/audio-format
 import { COMPLETED_STATUSES } from '@/lib/constants/request-statuses';
 import fs from 'fs';
 import path from 'path';
-import archiver from 'archiver';
+import { ZipArchive } from 'archiver';
 import { PassThrough } from 'stream';
 
 const logger = RMABLogger.create('API.Download');
@@ -118,7 +118,7 @@ export async function GET(
 
     // Multiple files — stream zip via archiver (avoids loading all files into memory)
     const passThrough = new PassThrough();
-    const archive = archiver('zip', { zlib: { level: 6 } });
+    const archive = new ZipArchive({ zlib: { level: 6 } });
     archive.pipe(passThrough);
     for (const filePath of matchingFiles) {
       archive.file(filePath, { name: path.basename(filePath) });
