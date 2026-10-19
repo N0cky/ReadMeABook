@@ -24,12 +24,13 @@ export const USAGE = `usage:
        [--backend abs|plex] [--upgrade-from <release tag, e.g. 1.2.3>] [--evidence <dir>]
        [--offline-fixtures] [--rm-image] [--allow-log-canary] [--isolation-check] [--allow-untracked]
        [--overrides <name,name>]   (trusted e2e/overrides/*.yml; untainted only)
+       [--isolate-specs]           (fresh stack per --specs entry, same images)
   node e2e/run.mjs unit --slug <s> --worktree <dir> (--trusted | --tainted) [--evidence <dir>]
   (--tainted and --pr-dockerfile are currently disabled)
   node e2e/run.mjs preview --image <ref> [--replace-image <ref>] [--evidence <dir>]
   node e2e/run.mjs down --slug <s> [--force-reserved]`;
 
-const FLAGS = new Set(['offline-fixtures', 'rm-image', 'help', 'trusted', 'tainted', 'pr-dockerfile', 'allow-log-canary', 'force-reserved', 'isolation-check', 'allow-untracked']);
+const FLAGS = new Set(['offline-fixtures', 'rm-image', 'help', 'trusted', 'tainted', 'pr-dockerfile', 'allow-log-canary', 'force-reserved', 'isolation-check', 'allow-untracked', 'isolate-specs']);
 const VALUE_OPTIONS = new Set(['slug', 'port', 'image', 'worktree', 'dockerfile', 'specs', 'scenario', 'backend', 'upgrade-from', 'evidence', 'overrides', 'replace-image']);
 
 /** `child` is inside `parent` (or equal). Case-insensitive on Windows. */

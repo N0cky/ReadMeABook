@@ -170,7 +170,8 @@ async function upgradeFlow(ctx, image) {
 async function finish(ctx, status) {
   const logs = saveLogs(ctx, 'compose.log');
   saveRecorder({ project: ctx.project, env: ctx.env, token: ctx.token, file: path.join(ctx.evidence, 'fake-arr-requests.json') });
-  const leaks = canaryLines(logs, readEnvFile().PROWLARR_API_KEY);
+  // Every stack of the run counts (isolated specs each had their own stack and logs).
+  const leaks = canaryLines([...ctx.priorLogs, logs].join('\n'), readEnvFile().PROWLARR_API_KEY);
   ctx.summary.canaryInRmabLogs = leaks.slice(0, 20);
   if (leaks.length && status === 0) {
     if (ctx.opts['allow-log-canary']) ctx.warn(`${leaks.length} rmab log line(s) contain the Prowlarr canary key (allowed by --allow-log-canary)`);
@@ -188,7 +189,7 @@ async function stackOrPreview(opts) {
   const project = opts.command === 'preview' ? PREVIEW_PROJECT : `rmab-e2e-${opts.slug}`;
   const token = newControlToken();
   const ctx = {
-    opts, evidence, project, token, runner: null, sizeRefs: [], created: [], pulled: [], env: stackEnv(opts, token),
+    opts, evidence, project, token, runner: null, sizeRefs: [], created: [], pulled: [], priorLogs: [], env: stackEnv(opts, token),
     summary: { command: opts.command, slug: opts.slug, project, tainted: !!opts.tainted, startedAt: new Date().toISOString(), warnings: [] },
   };
   ctx.warn = (msg) => {
@@ -212,9 +213,22 @@ async function stackOrPreview(opts) {
     } else ctx.summary.execBridge = 'off (tainted)';
     if (opts['upgrade-from']) status = await upgradeFlow(ctx, image);
     else {
-      up(ctx, image);
-      const specs = opts.command === 'preview' ? ['preview-seed.spec.ts'] : opts.specs.split(',').map((s) => s.trim());
-      status = await playwright(ctx, specs, opts.command === 'preview' ? 'preview' : 'stack');
+      const specs = opts.command === 'preview' ? ['preview-seed.spec.ts'] : opts.specs.split(',').map((s) => s.trim()).filter(Boolean);
+      // --isolate-specs: one fresh stack (down -v, up) per spec filter, same images, one runner phase each.
+      const groups = opts['isolate-specs'] && specs.length > 1 ? specs.map((s) => [s]) : [specs];
+      status = 0;
+      ctx.summary.specResults = {};
+      for (const [n, group] of groups.entries()) {
+        if (interrupted) throw new HarnessError('interrupted');
+        const tag = groups.length > 1 ? `-${group[0].replace(/[^a-z0-9]+/gi, '-').replace(/-+$/, '')}` : '';
+        if (n > 0) compose(project, ['down', '-v', '--remove-orphans'], ctx.env, { allowFail: true });
+        up(ctx, image);
+        const phase = opts.command === 'preview' ? 'preview' : `stack${tag}`;
+        const result = await playwright(ctx, group, phase);
+        ctx.summary.specResults[group.join(',')] = result === 0 ? 'pass' : 'fail';
+        if (groups.length > 1) ctx.priorLogs.push(saveLogs(ctx, `compose${tag}.log`));
+        status = Math.max(status, result);
+      }
       if (opts.tainted || opts['isolation-check']) {
         const probes = isolationProbes({ project, env: ctx.env });
         fs.writeFileSync(path.join(evidence, 'isolation.json'), JSON.stringify(probes, null, 2));

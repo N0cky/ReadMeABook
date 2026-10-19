@@ -12,6 +12,7 @@
 | `... --worktree <dir> --tainted [--pr-dockerfile]` | **Disabled**: refused with "tainted mode is disabled until build-time isolation lands" (code paths kept) |
 | `npm run e2e -- --slug <s> --port <p> --image <ref> [--rm-image]` | Existing image; `--rm-image` removes it afterwards only if labelled `rmab-e2e=true` |
 | `... --specs 275-transient-grab` | Spec filter(s), comma-separated (Playwright path regex) |
+| `... --isolate-specs` | One fresh stack (`down -v`, `up`) per `--specs` entry, same images; per-spec `results-stack-<spec>.json` + `compose-<spec>.log`. Use when specs share fixture books |
 | `... --dockerfile <file>` | Trusted runs only: override the Dockerfile (e.g. old commit + current `dockerfile.unified`) |
 | `... --upgrade-from 1.2.3` | `ghcr.io/kikootwo/readmeabook:1.2.3` (no `v`) → branch image on the same volumes |
 | `... --backend plex` | Plex-mode setup against fake Plex + local admin (Admin Login toggle) |
