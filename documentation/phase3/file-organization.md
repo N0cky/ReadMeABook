@@ -297,8 +297,9 @@ When user deletes and re-requests the same audiobook:
 | every file already in the library with different content | `already in the library with different content; source kept` (not a failure; no failure notification) |
 | merge kept outside the strict duration window | `merged file kept; sources kept` |
 | source folder not fully readable | `... source folder could not be fully read; source files kept` |
+| Kindle-fixed EPUB failed its read-back check (ebooks) | `Kindle fix could not be verified; original imported` (joined with `; ` to any message above) |
 
-- Kindle-fixed EPUB: the library gets the fixed copy; the original EPUB counts as imported once that copy is placed (`copied`/`identical`).
+- Kindle-fixed EPUB: the library gets the fixed copy only after it passes its read-back check (entries + CRCs + hashes); the original EPUB then counts as imported once that copy is placed (`copied`/`identical`). A copy that fails the check is never imported: the original is placed instead (its own byte-verified placement is the evidence) and the message is `Kindle fix could not be verified; original imported`.
 - EPUB folders: other files next to the ebook (cover, opf, extras) are not verified and go with the folder when it is removed.
 - Not covered here: seeded-torrent cleanup (`cleanup_seeded_torrents`) removes torrent data after seeding without import evidence, and library matching clears the partial-import message. Tracked separately.
 
