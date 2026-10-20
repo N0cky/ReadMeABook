@@ -154,6 +154,11 @@ Handles authentication and authorization: Multiple auth providers (Plex OAuth, O
 6. Profile's auth token is stored (encrypted)
 7. User record created with profile's details
 
+**Profile Identity (`POST /api/auth/plex/switch-profile`):**
+- `userId` must be an entry of `getHomeUsers(<cached main-account token>)` → else 403 `AccessDenied` (before any switch)
+- Identity from Plex only: with `profileInfo` (web client) → that entry's `uuid`, `title`, `email`, `thumb`; without → `getUserInfo(<profile token>)` id. Client `profileInfo` values are ignored
+- `canSignInAsPlexIdentity()` (`src/lib/services/auth/plex-identity.ts`, also used by the single-profile callback): plexId must look like a Plex id (`[A-Za-z0-9-]`, ≤128, never `local-*`) and any existing row must be a Plex user (`authProvider` `plex` or null) → else 403. The upsert never changes `role`
+
 **Profile Data Storage:**
 - `plexId`: Profile's unique ID (not main account ID)
 - `plexUsername`: Profile's friendlyName
@@ -293,6 +298,7 @@ oidc.admin_claim_value       = 'readmeabook-admin'
 
 ## Fixed Issues
 
+- **Plex profile identity:** profile switching now takes the profile's identity from Plex, not from the request; Plex sign-ins only write Plex user rows.
 - **#297 Hardcoded JWT fallback secrets:** `jwt.ts` fell back to built-in default strings when `JWT_SECRET`/`JWT_REFRESH_SECRET` were unset (installs that bypass the unified entrypoint). Fix: fallbacks removed; secrets derived from `CONFIG_ENCRYPTION_KEY` via HKDF. Affected installs: all sessions + download links invalidated on upgrade (re-login required).
 
 ## Tech Stack

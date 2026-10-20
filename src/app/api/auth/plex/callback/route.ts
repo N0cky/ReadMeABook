@@ -11,6 +11,7 @@ import { getAuthTokenCache } from '@/lib/services/auth-token-cache.service';
 import { generateAccessToken, generateRefreshToken } from '@/lib/utils/jwt';
 import { prisma } from '@/lib/db';
 import { RMABLogger } from '@/lib/utils/logger';
+import { canSignInAsPlexIdentity } from '@/lib/services/auth/plex-identity';
 
 const logger = RMABLogger.create('API.PlexCallback');
 
@@ -209,7 +210,19 @@ export async function GET(request: NextRequest) {
 
     logger.debug('Single profile or no additional profiles, continuing with main account authentication');
 
-    // No home users - continue with normal authentication flow using main account
+    // No home users - continue with normal authentication flow using main account.
+    // The plexId comes from Plex (/users/account); it may only land on a Plex user's row.
+    if (!(await canSignInAsPlexIdentity(plexIdString))) {
+      logger.warn('Plex sign-in refused: identity is not a Plex user identity');
+      return NextResponse.json(
+        {
+          error: 'AccessDenied',
+          message: 'This Plex account cannot be used to sign in. Please contact the administrator.',
+        },
+        { status: 403 }
+      );
+    }
+
     // Check if this is the first user (should be promoted to admin)
     const userCount = await prisma.user.count();
     const isFirstUser = userCount === 0;
