@@ -36,7 +36,7 @@ All-in-one Docker image for simple deployment. PostgreSQL + Redis + App in singl
 
 ## Dockerfile Structure
 
-**Base:** `node:20-bookworm` (debian with node)
+**Base:** `node:24-bookworm` (debian bookworm with Node.js 24 LTS; floating tag, so release builds pick up Node 24 patch releases)
 
 **Installed packages:**
 - postgresql-16
@@ -57,11 +57,12 @@ All-in-one Docker image for simple deployment. PostgreSQL + Redis + App in singl
 | Stage | From | Does | Shipped |
 |---|---|---|---|
 | `ffmpeg` | `mwader/static-ffmpeg@sha256:…` | pinned ffmpeg/ffprobe | copied |
-| `base` | `node:20-bookworm` | apt (postgres, redis, supervisor, gosu, locales), ffmpeg + guard, purge imagemagick | yes (OS layer) |
-| `builder` | `node:20-bookworm` | `npm ci` (all deps) → `COPY . .` → `prisma generate` → `next build` (standalone) | no |
-| `prisma-cli` | `node:20-bookworm` | Prisma CLI closure from `package-lock.json` → `/opt/prisma-cli` | no |
+| `base` | `node:24-bookworm` | apt (postgres, redis, supervisor, gosu, locales), ffmpeg + guard, purge imagemagick | yes (OS layer) |
+| `builder` | `node:24-bookworm` | `npm ci` (all deps) → `COPY . .` → `prisma generate` → `next build` (standalone) | no |
+| `prisma-cli` | `node:24-bookworm` | Prisma CLI closure from `package-lock.json` → `/opt/prisma-cli` | no |
 | `runtime` | `base` | app artifacts below + guard | yes |
 - Requires BuildKit (`RUN --network=none`, `RUN --mount=type=bind`): the legacy builder (`DOCKER_BUILDKIT=0`, the default before Docker 23, e.g. on 20.10) can't build it; use Docker 23+ or `docker buildx build`
+- Node major: all three `node:` stages share one tag, and `e2e/Dockerfile.test`, `e2e/fake-arr/Dockerfile` and both CI workflows (`node-version`) use the same major; `tests/docker/node-version-pins.test.ts` fails on a partial bump. `@types/node` follows the major (Dependabot ignores its majors)
 - `builder`/`prisma-cli` must stay on bookworm and build for TARGETPLATFORM (never `--platform=$BUILDPLATFORM`): Prisma engines + bcrypt are native
 - `builder` WORKDIR must stay `/app` (generated client records absolute paths)
 - Version vars: `builder` sets `APP_VERSION`/`GIT_COMMIT`/`BUILD_DATE` + `NEXT_PUBLIC_*` before `next build` (inlined into VersionBadge); `runtime` re-declares the ARGs + ENVs (`/api/version`)
@@ -101,6 +102,8 @@ All-in-one Docker image for simple deployment. PostgreSQL + Redis + App in singl
 - Recovery also requires every `/app/scripts/lib/*.js`; `terminal-prompt.js` and `password-users.js` must exist
 - Layout: required runtime paths exist; none of the non-runtime paths (`src/{app,components,contexts,hooks,lib}`, `tests`, `e2e`, `screenshots`, `documentation`, `docker`, `dockerfile.unified`, `package-lock.json`, `tsconfig.json`) is in `/app`
 - Note: Next 16 `next build` uses Turbopack even with `TURBOPACK=0` (chunk names `[turbopack]_runtime.js`)
+- System users (uid:gid) are exactly `postgres=102:106`, `redis=101:105`, `node=1000:1000` (the IDs every bookworm release shipped; default volume ownership depends on them). The PUID/LXC sections below say postgres 103 / redis 102: the shipped images use 102 / 101. Prints `node <version> (napi, openssl)` for the build log
+- Builtins are skipped with `module.isBuiltin` (Node 24's `builtinModules` lists prefix-only modules such as `node:sqlite` only with the prefix)
 - Every ELF file in `/app` + ffmpeg/ffprobe has the build arch's `e_machine`; expects 1 schema engine, ≥2 `libquery_engine` copies, a bcrypt `.node` binding (bcrypt 5 `bcrypt_lib.node`, bcrypt 6 `prebuilds/linux-<arch>/bcrypt.*.node`)
 
 **Guard failures:**
@@ -109,6 +112,7 @@ All-in-one Docker image for simple deployment. PostgreSQL + Redis + App in singl
 - `unresolvable require("x") in .next/server/…` → standalone tracing missed a server external; fix tracing or add an explicit `COPY`
 - `require("x") … resolves but does not load` → a traced external is missing one of its own dependencies (tracing gap); same fix
 - `non-runtime files in /app` → one of the guard's listed paths (`NOT_SHIPPED` in `runtime-guard.js`) is back in the whole-project trace; restore its `outputFileTracingExcludes` entry in `next.config.ts`. The guard checks only that list, not every new path: keep `NOT_SHIPPED` and the excludes in sync, and add a new top-level dir or `src/` folder to both
+- `system user X is a:b, expected c:d` → the base image or the apt install order changed the account IDs; existing volumes would change owner. Never ship it; pin the base or restore the IDs
 - `e_machine 0x.., expected 0x..` → wrong-arch native file (e.g. a `--platform=$BUILDPLATFORM` stage); never ship it
 
 **Build process:**
@@ -530,6 +534,23 @@ rm -rf pgdata redis config cache
 docker compose up -d
 ```
 
+**TLS errors after the Node 24 image (`EE certificate key too weak`, `dh key too small`):**
+
+*Cause:* Node 24 (OpenSSL 3.5) uses OpenSSL security level 2; Node 20 images used level 1. A server with an RSA key or DH parameters under 2048 bits is refused:
+- `EE certificate key too weak`: the certificate is verified and its key is < 2048 bits (a 1024-bit self-signed cert with a trusted CA, or an old public cert)
+- `dh key too small`: a TLS 1.2 server picks DHE with < 2048-bit DH parameters; fails even with certificate verification turned off
+- Affects every outbound HTTPS connection from the app: download clients, Audiobookshelf, Plex, Prowlarr, Apprise/ntfy/webhooks, BookDate, OIDC issuers, an external `REDIS_URL` over TLS
+
+*Fix (preferred):* give the server a 2048-bit (or larger) RSA/ECDSA certificate and ≥ 2048-bit DH parameters (or ECDHE only).
+
+*Workaround (lowers security for every connection the app makes):*
+```yaml
+environment:
+  NODE_OPTIONS: "--tls-cipher-list=DEFAULT@SECLEVEL=1"
+```
+- Reaches the app (`node server.js`) and `npm run rmab:recover` through the container env; the image itself keeps level 2
+- Not needed for TLS 1.3 servers with a ≥ 2048-bit key, or when verification is off and the server uses ECDHE
+
 **Database access:**
 ```bash
 docker exec -it readmeabook-unified \
@@ -774,6 +795,12 @@ docker volume rm readmeabook-pgdata readmeabook-redis readmeabook-cache
 - Issue: single-stage build shipped the full `npm ci` layer (devDependencies survive `npm prune` in earlier layers), `src/`, tests, the build cache and a duplicate standalone tree
 - Latent: CLI present only because prune keeps `devOptional` prisma; recovery worked only because `COPY . .` shipped `scripts/` + `src/generated/prisma`; a missing CLI made `npx prisma` fetch the latest prisma at start, then `|| echo` hid any failure
 - Fix: multi-stage build (idea + first version: PR #279, ChaoticSciuridae); CLI from the lockfile (`prisma-cli` stage); explicit copies for `scripts/`, the generated client, `prisma/`; entrypoint preflight + absolute `PRISMA_CLI`; offline runtime guard
+
+**21. Node.js 20 end of life → Node.js 24**
+- Change: all image stages, `e2e/Dockerfile.test`, `e2e/fake-arr/Dockerfile` and CI moved to Node 24 together; `@types/node` ^24
+- Native modules unchanged: bcrypt 6 and the Prisma engines are Node-API, the same binaries as on Node 20
+- Behaviour change: OpenSSL security level 2 (see Troubleshooting → TLS errors)
+- Guards added: system user IDs, Node/OpenSSL version line, `isBuiltin` for builtins
 
 ## Related
 
